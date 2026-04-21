@@ -1,0 +1,6 @@
+-r requirements.txt
+mlflow>=2.14.0
+minio>=7.2.0
+huggingface_hub>=1.11.0
+python-dotenv>=1.2.2
+setuptools>=65.0.0
