@@ -48,7 +48,7 @@ class MinioStorage(StorageBackend):
         endpoint = os.getenv(f"{prefix}_ENDPOINT") or os.getenv("URL")
         access_key = os.getenv(f"{prefix}_ACCESS_KEY") or os.getenv("ACCESS_KEY")
         secret_key = os.getenv(f"{prefix}_SECRET_KEY") or os.getenv("SECRET_KEY")
-        bucket = os.getenv(f"{prefix}_BUCKET", "raw-data")
+        bucket = os.getenv(f"{prefix}_BUCKET", "data")
         secure = os.getenv(f"{prefix}_SECURE", "false").lower() == "true"
 
         missing = [
