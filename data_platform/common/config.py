@@ -61,11 +61,13 @@ class MlflowConfig:
     def from_env(cls, prefix: str = "MLFLOW") -> "MlflowConfig":
         """Build an MLflow config object from environment variables."""
 
-        tracking_uri = os.getenv(f"{prefix}_TRACKING_URI") or os.getenv("MLFLOW_TRACKING_URI")
+        tracking_uri = os.getenv(f"{prefix}_TRACKING_URI")
         if not tracking_uri:
-            raise ConfigurationError("Missing MLflow tracking URI (set MLFLOW_TRACKING_URI).")
+            raise ConfigurationError(
+                f"Missing MLflow tracking URI (set {prefix}_TRACKING_URI)."
+            )
         experiment_name = os.getenv(f"{prefix}_EXPERIMENT_NAME", "default")
-        insecure_tls = os.getenv(f"{prefix}_INSECURE_TLS", "false").lower() == "true"
+        insecure_tls = os.getenv(f"{prefix}_TRACKING_INSECURE_TLS", "false").lower() == "true"
         return cls(
             tracking_uri=tracking_uri,
             experiment_name=experiment_name,
