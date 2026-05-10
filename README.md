@@ -47,6 +47,9 @@ MLFLOW_TRACKING_URI=https://your-mlflow-host/mlflow/
 MLFLOW_EXPERIMENT_NAME=burnit-bg
 MLFLOW_TRACKING_INSECURE_TLS=true
 ```
+## Huggingface resources for the project
+[Data bucket](https://huggingface.co/buckets/kiplayo/data)
+
 
 ## Repository Organization
 
