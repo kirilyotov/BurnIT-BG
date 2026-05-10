@@ -11,13 +11,76 @@ from data_platform.common.exceptions import StorageError
 
 
 class HuggingFaceStorage:
-    """Hugging Face Hub backend for model and dataset repositories."""
+    """
+    Hugging Face Hub backend for model, dataset repositories, and bucket storage.
+    """
 
     def __init__(self, token: str | None = None) -> None:
         """Create a Hugging Face Hub client optionally authenticated by token."""
 
         self.token = token
         self.api = huggingface_hub.HfApi(token=token)
+        
+
+    @classmethod
+    def from_env(cls, token_env: str = "HF_TOKEN"):
+        """
+        Initialize HuggingFaceStorage from environment variable for token.
+        Args:
+            token_env: Environment variable for token.
+        """
+        import os
+        token = os.environ.get(token_env)
+        return cls(token=token)
+
+    # --- Bucket API methods ---
+    def save_file_to_bucket(self, bucket_id: str, local_path: str, remote_path: str):
+        """
+        Upload a single file to the Hugging Face bucket.
+        """
+        self.api.batch_bucket_files(bucket_id, add=[(local_path, remote_path)])
+        
+        
+    def list_buckets(self):
+        """
+        List all buckets accessible with the current token.
+        """
+        return self.api.list_buckets()
+
+    def save_directory_to_bucket(self, bucket_id: str, local_dir: str, remote_prefix: str = ""):
+        """
+        Recursively upload all files under local_dir to the bucket at remote_prefix.
+        """
+        import os
+        add = []
+        for root, _, files in os.walk(local_dir):
+            for file in files:
+                local_file = os.path.join(root, file)
+                rel_path = os.path.relpath(local_file, local_dir)
+                remote_file = f"{remote_prefix}/{rel_path}" if remote_prefix else rel_path
+                add.append((local_file, remote_file))
+        self.api.batch_bucket_files(bucket_id, add=add)
+
+    def load_file_from_bucket(self, bucket_id: str, remote_path: str, local_path: str):
+        """
+        Download a single file from the Hugging Face bucket.
+        """
+        self.api.download_bucket_files(bucket_id, files=[(remote_path, local_path)])
+
+    def load_directory_from_bucket(self, bucket_id: str, remote_prefix: str, local_dir: str):
+        """
+        Download all files under remote_prefix in the bucket to local_dir.
+        """
+        items = self.api.list_bucket_tree(bucket_id, prefix=remote_prefix, recursive=True)
+        files = [(item.path, f"{local_dir}/{item.path[len(remote_prefix):].lstrip('/')}")
+                 for item in items if item.type == "file"]
+        self.api.download_bucket_files(bucket_id, files=files)
+
+    def list_bucket_objects(self, bucket_id: str, prefix: str = "", recursive: bool = True):
+        """
+        List all objects in the bucket under prefix.
+        """
+        return list(self.api.list_bucket_tree(bucket_id, prefix=prefix, recursive=recursive))
 
     def save_model(
         self,
