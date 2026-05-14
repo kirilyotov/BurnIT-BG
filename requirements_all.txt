@@ -1,0 +1,7 @@
+-r requirements.txt
+-r requirements_package.txt
+-r requirements_data_transformation.txt
+-r requirements_data_scrapping.txt
+-r requirements_local_dev.txt
+-r requirements_test.txt
+-r requirements_experiments.txt

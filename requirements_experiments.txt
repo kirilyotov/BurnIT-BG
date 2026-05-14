@@ -1,0 +1,30 @@
+-r requirements.txt
+-r requirements_package.txt
+
+# LLM training stack — install when working on experiments/ notebooks.
+# These are heavy GPU-oriented packages; install separately from the
+# core platform so the platform deps don't carry CUDA wheels.
+
+# Hugging Face stack
+transformers>=4.46.0
+datasets>=3.0.0
+accelerate>=1.1.0
+peft>=0.13.0
+bitsandbytes>=0.44.0
+
+# Trainer + RL
+trl>=0.12.0
+
+# Unsloth (fast LoRA/QLoRA). Optional — falls back to plain transformers+peft
+# when unavailable. See experiments/shared/model_utils.py.
+# unsloth @ git+https://github.com/unslothai/unsloth.git
+unsloth>=2024.10.0; platform_system != "Darwin"
+
+# Evaluation / metrics
+scikit-learn>=1.5.0
+sentencepiece>=0.2.0
+tiktoken>=0.8.0
+
+# Plotting (already in requirements.txt but pinned higher for nb stability)
+matplotlib>=3.9.0
+seaborn>=0.13.0
