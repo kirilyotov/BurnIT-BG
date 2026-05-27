@@ -29,6 +29,7 @@ from .kaggle_dataset import (
     dataset_slug as kaggle_dataset_slug,
     download_repo as kaggle_download_repo,
 )
+from .build_dataset import BuildConfig, build_dataset, maybe_upload
 from .io_utils import RecordWriter, get_nested, read_records, set_nested
 from .translate import Translator, TranslatorConfig
 
@@ -77,7 +78,7 @@ def _build_storage(
     return StorageBackend(backend=backend, bucket=bucket)
 
 
-# ----- translate ------------------------------------------------------------
+# ###### translate ######
 
 
 def _cmd_translate(args: argparse.Namespace) -> int:
@@ -130,7 +131,7 @@ def _detect_string_keys(record: dict) -> List[str]:
     return [k for k, v in record.items() if isinstance(v, str)]
 
 
-# ----- filter-language ------------------------------------------------------
+# ###### filter-language ######
 
 
 def _cmd_filter_language(args: argparse.Namespace) -> int:
@@ -198,7 +199,7 @@ def _cmd_filter_language(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----- hf-dataset -----------------------------------------------------------
+# ###### hf-dataset ######
 
 
 def _cmd_hf_dataset(args: argparse.Namespace) -> int:
@@ -266,7 +267,7 @@ def _cmd_hf_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----- kaggle-dataset -------------------------------------------------------
+# ###### kaggle-dataset ######
 
 
 def _cmd_kaggle_dataset(args: argparse.Namespace) -> int:
@@ -351,7 +352,39 @@ def _cmd_kaggle_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----- argument parser ------------------------------------------------------
+# ###### from-passages ######
+
+
+def _cmd_from_passages(args: argparse.Namespace) -> int:
+    """Build an Alpaca-style mental-health JSONL from extracted passages."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+
+    cfg = BuildConfig(
+        input_path=Path(args.input),
+        output_path=Path(args.output),
+        seed=args.seed,
+        min_words=args.min_words,
+        max_chars=args.max_chars,
+        drop_dangerous=not args.allow_dangerous,
+        extraction_date=args.date,
+        quality_score=args.quality_score,
+    )
+    total_in, total_out = build_dataset(cfg)
+    print(f"\nbuild-from-passages: read {total_in} passages, wrote {total_out} records "
+          f"-> {cfg.output_path}")
+
+    if not args.skip_minio:
+        try:
+            uri = maybe_upload(cfg.output_path, source=args.source, date=args.date, bucket=args.bucket)
+            if uri:
+                print(f"uploaded -> {uri}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] MinIO upload failed: {exc}", file=sys.stderr)
+    return 0
+
+
+# ###### argument parser ######
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -513,6 +546,33 @@ def build_parser() -> argparse.ArgumentParser:
     pk.add_argument("--skip-minio", action="store_true")
     pk.add_argument("--skip-hf", action="store_true")
 
+    pfp = sub.add_parser(
+        "from-passages",
+        help="Build a Bulgarian Alpaca dataset from extracted Chitanka passages.",
+    )
+    pfp.add_argument("--input", required=True,
+                     help="Path to passages JSONL produced by data_scraping extract-passages.")
+    pfp.add_argument("--output", required=True,
+                     help="Where to write the Alpaca JSONL.")
+    pfp.add_argument("--source", default="chitanka",
+                     help="Source label baked into each record's metadata + MinIO path.")
+    pfp.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
+                     help="Date segment used in the MinIO destination key.")
+    pfp.add_argument("--seed", type=int, default=42,
+                     help="Random seed for the instruction-template sampler.")
+    pfp.add_argument("--min-words", type=int, default=30,
+                     help="Drop records whose output has fewer than N whitespace tokens.")
+    pfp.add_argument("--max-chars", type=int, default=1500,
+                     help="Trim outputs longer than this many characters.")
+    pfp.add_argument("--quality-score", type=float, default=0.80,
+                     help="Default quality_score baked into every record (0..1).")
+    pfp.add_argument("--allow-dangerous", action="store_true",
+                     help="Disable the dangerous-phrase filter (NOT recommended).")
+    pfp.add_argument("--bucket", default=None,
+                     help="MinIO bucket override (defaults to env MINIO_BUCKET).")
+    pfp.add_argument("--skip-minio", action="store_true",
+                     help="Don't upload the built JSONL to MinIO; write only locally.")
+
     return parser
 
 
@@ -527,6 +587,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_hf_dataset(args)
     if args.command == "kaggle-dataset":
         return _cmd_kaggle_dataset(args)
+    if args.command == "from-passages":
+        return _cmd_from_passages(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

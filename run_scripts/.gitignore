@@ -1,0 +1,3 @@
+_tmp/
+tmp/test/
+*.duckdb

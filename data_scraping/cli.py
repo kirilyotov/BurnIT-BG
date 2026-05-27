@@ -17,8 +17,10 @@ from typing import Optional
 import duckdb
 
 from .download_books import PipelineConfig, run_pipeline
+from .extract_passages import ExtractionConfig, run_extraction
 from .sources import SOURCES, ChitankaSource, GutenbergSource
 from .storage_backend import StorageBackend
+from .topics_mental_health import all_topics
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DUCKDB = REPO_ROOT / "tmp" / "data_scraping" / "books.duckdb"
@@ -161,6 +163,36 @@ def _cmd_upload_metadata(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_extract_passages(args: argparse.Namespace) -> int:
+    _load_env()
+    storage = _build_storage(args)
+    topics = tuple(t.strip() for t in args.topics.split(",") if t.strip()) if args.topics else ()
+    formats = tuple(f.strip() for f in args.formats.split(",") if f.strip()) if args.formats else ()
+    book_ids = tuple(b.strip() for b in args.book_ids.split(",") if b.strip()) if args.book_ids else ()
+    cfg = ExtractionConfig(
+        storage=storage,
+        bucket=args.bucket or os.getenv("MINIO_BUCKET", "data"),
+        source=args.source,
+        extract_date=args.extract_date,
+        books_date=args.books_date,
+        topics=topics,
+        min_chars=args.min_chars,
+        max_chars=args.max_chars,
+        per_book_limit=args.per_book,
+        overall_limit=args.limit,
+        duckdb_path=Path(args.duckdb),
+        tmp_dir=Path(args.tmp_dir),
+        remote_prefix=args.remote_prefix,
+        output_filename=args.filename,
+        book_id_filter=book_ids,
+        format_filter=formats,
+        verbose=True,
+    )
+    output_path, total = run_extraction(cfg)
+    print(f"\nextract done: {total} passages -> {output_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data_scraping", description="Book ingestion pipeline.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -200,6 +232,55 @@ def build_parser() -> argparse.ArgumentParser:
         type=lambda v: v.lower() in ("1", "true", "yes"),
     )
 
+    p_ex = sub.add_parser(
+        "extract-passages",
+        help="Read downloaded books from MinIO and extract mental-health passages.",
+    )
+    p_ex.add_argument("--source", default="chitanka", help="Source name in the manifest (default: chitanka).")
+    p_ex.add_argument(
+        "--extract-date",
+        default=datetime.now().strftime("%Y-%m-%d"),
+        help="Output tag — used in the JSONL filename and MinIO destination key. Default: today.",
+    )
+    p_ex.add_argument(
+        "--books-date",
+        default=None,
+        help="OPTIONAL: only extract from books whose MinIO path contains this date "
+             "(e.g. raw/chitanka/2026-05-14/...). Default: every book in the manifest.",
+    )
+    p_ex.add_argument("--topics", default=None,
+                      help=f"Comma-separated topic list (default: all). Available: {','.join(all_topics())}")
+    p_ex.add_argument("--book-ids", default=None,
+                      help="Restrict to specific book ids (comma-separated).")
+    p_ex.add_argument("--formats", default=None,
+                      help="Restrict to formats (comma-separated, e.g. 'epub,fb2').")
+    p_ex.add_argument("--min-chars", type=int, default=80)
+    p_ex.add_argument("--max-chars", type=int, default=1200)
+    p_ex.add_argument("--per-book", type=int, default=None,
+                      help="Max passages kept per book (default: unlimited).")
+    p_ex.add_argument("--limit", type=int, default=None,
+                      help="Overall cap on passages across all books (default: unlimited).")
+    p_ex.add_argument("--remote-prefix", default="extracted",
+                      help="MinIO prefix for the JSONL output (default: 'extracted'). "
+                           "Full path: {prefix}/{source}/{extract-date}/{filename}.jsonl.")
+    p_ex.add_argument("--filename", default="passages",
+                      help="Base filename (no extension) for the JSONL output. "
+                           "Local: {tmp_dir}/{filename}-{extract-date}.jsonl. "
+                           "MinIO: {prefix}/{source}/{extract-date}/{filename}.jsonl. "
+                           "Default: 'passages'.")
+    p_ex.add_argument("--duckdb", default=str(DEFAULT_DUCKDB))
+    p_ex.add_argument("--tmp-dir", default=str(REPO_ROOT / "tmp/data_scraping/extracted"))
+    p_ex.add_argument("--backend", default="minio", choices=["minio", "local", "huggingface"])
+    p_ex.add_argument("--bucket", default=None)
+    p_ex.add_argument("--minio-endpoint", default=None)
+    p_ex.add_argument("--minio-access-key", default=None)
+    p_ex.add_argument("--minio-secret-key", default=None)
+    p_ex.add_argument(
+        "--secure",
+        default=None,
+        type=lambda v: v.lower() in ("1", "true", "yes"),
+    )
+
     return parser
 
 
@@ -212,6 +293,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cmd_source(args, "project_gutenberg")
     if args.command == "upload-metadata":
         return _cmd_upload_metadata(args)
+    if args.command == "extract-passages":
+        return _cmd_extract_passages(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

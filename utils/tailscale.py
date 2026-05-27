@@ -115,7 +115,7 @@ def install_tailscale(*, force: bool = False) -> None:
         return
     log.info("installing tailscale via official script")
     subprocess.check_call(
-        "curl -fsSL https://tailscale.com/install.sh | sh",
+        "curl -fsSL https://tailscale.com/install.sh | sudo sh",
         shell=True,
     )
     if not is_installed():
