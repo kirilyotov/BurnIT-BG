@@ -122,6 +122,15 @@ def install_tailscale(*, force: bool = False) -> None:
         raise RuntimeError("`tailscale` binary not found after install")
 
 
+def _redact_authkey(args: list[str]) -> list[str]:
+    """Return ``args`` with any ``--authkey=...`` value replaced by ``***``."""
+    return [a if not a.startswith("--authkey=") else "--authkey=***" for a in args]
+
+
+class TailscaleUpError(RuntimeError):
+    """Raised when ``tailscale up`` exits non-zero. Always carries a redacted message."""
+
+
 def bring_up(
     auth_key: str,
     *,
@@ -132,6 +141,11 @@ def bring_up(
     extra_args: list[str] | None = None,
 ) -> None:
     """Run ``sudo tailscale up`` with the given auth key.
+
+    On failure raises :class:`TailscaleUpError` whose message contains the
+    redacted command and tailscale's stderr — never the real auth key.
+    The native ``CalledProcessError`` includes the full argv in its
+    string representation, so we explicitly avoid letting it bubble.
 
     Args:
         auth_key: Tailscale auth key (one-time or reusable).
@@ -156,9 +170,19 @@ def bring_up(
         cmd.append("--accept-dns")
     if extra_args:
         cmd += list(extra_args)
-    redacted = [c if "authkey" not in c else "--authkey=***" for c in cmd]
+    redacted = _redact_authkey(cmd)
     log.info("running: %s", " ".join(redacted))
-    subprocess.check_call(cmd)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stderr or stdout or f"exit status {proc.returncode}"
+        # Belt-and-braces: if the auth key ever appears in tailscale's own
+        # output, scrub it before we raise.
+        detail = detail.replace(auth_key, "***") if auth_key else detail
+        raise TailscaleUpError(
+            f"`{' '.join(redacted)}` failed (exit {proc.returncode}): {detail}"
+        )
 
 
 def setup(
@@ -222,9 +246,18 @@ def setup_in_colab(
         print("[tailscale] installing + bringing up …")
     try:
         ok = setup(auth_key=auth_key, node_hostname=node_hostname)
-    except (RuntimeError, subprocess.CalledProcessError) as exc:
+    except TailscaleUpError as exc:
+        # Already-scrubbed message from bring_up — safe to print verbatim.
         if not quiet:
             print(f"[tailscale] setup failed: {exc}")
+        return False
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        # Defensive scrub in case a different code path leaks the key.
+        msg = str(exc)
+        if auth_key:
+            msg = msg.replace(auth_key, "***")
+        if not quiet:
+            print(f"[tailscale] setup failed: {msg}")
         return False
 
     if not quiet:
@@ -235,6 +268,7 @@ def setup_in_colab(
 
 
 __all__ = [
+    "TailscaleUpError",
     "is_installed",
     "is_connected",
     "status",
