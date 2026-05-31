@@ -4,7 +4,7 @@ Everything here is pure ``torch`` / ``numpy`` and works for any
 HuggingFace-compatible causal LM. No Unsloth dependency.
 """
 
-from __future__ import annotations
+import matplotlib.pyplot as plt
 
 import math
 import time
@@ -137,4 +137,75 @@ def vram_snapshot() -> dict[str, float]:
         "vram_allocated_mb": torch.cuda.memory_allocated() / 1024**2,
         "vram_reserved_mb": torch.cuda.memory_reserved() / 1024**2,
         "vram_peak_mb": torch.cuda.max_memory_allocated() / 1024**2,
+    }
+
+
+def compute_bertscore(predictions, references, *, lang="bg", model_type=None) -> dict:
+    """BERTScore P/R/F1. Lazy-imports evaluate; lang='bg' → mBERT; pass model_type='xlm-roberta-large' for stronger."""
+    import evaluate
+    kw = {"lang": lang} if model_type is None else {"model_type": model_type}
+    bs = evaluate.load("bertscore")
+    r = bs.compute(predictions=list(predictions), references=list(references), **kw)
+    n = len(r["f1"]) or 1
+    return {"bertscore_P": sum(r["precision"])/n,
+            "bertscore_R": sum(r["recall"])/n,
+            "bertscore_F1": sum(r["f1"])/n}
+
+
+def compute_rouge(predictions, references) -> dict:
+    """ROUGE-L F1. use_stemmer=False (Porter is English-only)."""
+    import evaluate
+    r = evaluate.load("rouge").compute(predictions=list(predictions), references=list(references), use_stemmer=False)
+    return {"rougeL_F1": float(r["rougeL"]) if not hasattr(r["rougeL"], "mid") else float(r["rougeL"].mid.fmeasure)}
+
+
+def plot_train_eval_loss(history, *, best_step=None, title="loss"):
+    """train/eval loss over steps; optional vertical line at best checkpoint."""
+    import matplotlib.pyplot as plt
+    tr = [(h["step"], h["loss"]) for h in history if "loss" in h and "eval_loss" not in h]
+    ev = [(h["step"], h["eval_loss"]) for h in history if "eval_loss" in h]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    if tr: ax.plot(*zip(*tr), label="train_loss")
+    if ev: ax.plot(*zip(*ev), label="eval_loss", marker="o")
+    if best_step is not None: ax.axvline(best_step, ls="--", c="grey", label="best ckpt")
+    ax.set_xlabel("step"); ax.set_ylabel("loss"); ax.set_title(title)
+    ax.legend(); ax.grid(True, alpha=.3)
+    return fig
+
+
+def plot_grad_norm(history, *, title="gradient norm"):
+    """Plot grad_norm from trainer.state.log_history."""
+    import matplotlib.pyplot as plt
+    pts = [(h["step"], h.get("grad_norm")) for h in history if "grad_norm" in h]
+    fig, ax = plt.subplots(figsize=(7, 3))
+    if pts: ax.plot(*zip(*pts))
+    ax.set_xlabel("step"); ax.set_ylabel("grad_norm"); ax.set_title(title); ax.grid(True, alpha=.3)
+    return fig
+
+
+def plot_metric_scorecard(metrics: dict, *, title="scorecard"):
+    """Horizontal bar of normalized [0,1] metrics. Caller must normalize (e.g. 1/(1+ppl))."""
+    keys = list(metrics.keys()); vals = [float(metrics[k]) for k in keys]
+    fig, ax = plt.subplots(figsize=(8, 0.45*len(keys)+1))
+    ax.barh(keys, vals); ax.set_xlim(0, 1.0); ax.set_title(title)
+    for i, v in enumerate(vals): ax.text(min(v+0.01, 0.98), i, f"{v:.3f}", va="center")
+    ax.grid(True, axis="x", alpha=.3)
+    return fig
+
+
+def overfit_summary(history) -> dict:
+    """Return {'final_train_loss','final_eval_loss','overfit_gap','min_eval_loss','min_eval_step','underfit_warning':bool,'initial_train_loss':float}."""
+    tr = [h["loss"] for h in history if "loss" in h and "eval_loss" not in h]
+    ev = [(h["step"], h["eval_loss"]) for h in history if "eval_loss" in h]
+    init_tr = float(tr[0]) if tr else 0.0
+    fin_tr = float(tr[-1]) if tr else 0.0
+    fin_ev = float(ev[-1][1]) if ev else float("nan")
+    min_step, min_ev = (min(ev, key=lambda x: x[1]) if ev else (None, float("nan")))
+    gap = (fin_ev - fin_tr) if ev else float("nan")
+    underfit = (init_tr > 0 and fin_tr > 0.6 * init_tr)
+    return {
+        "initial_train_loss": init_tr, "final_train_loss": fin_tr,
+        "final_eval_loss": fin_ev, "overfit_gap": gap,
+        "min_eval_loss": float(min_ev), "min_eval_step": min_step,
+        "underfit_warning": bool(underfit),
     }
