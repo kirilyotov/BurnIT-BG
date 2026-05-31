@@ -15,6 +15,13 @@ bitsandbytes>=0.44.0
 # Trainer + RL
 trl>=0.12.0
 
+# GaLore optimizer (experiment 10) — low-memory full-parameter training.
+galore-torch>=1.0; platform_system != "Darwin"
+
+# MLflow GenAI extras — evaluation tables/UI + make_genai_metric, used
+# alongside the custom NVIDIA judge panel in experiments/shared/judge_utils.py.
+mlflow[genai]>=2.14.0
+
 # Unsloth (fast LoRA/QLoRA). Optional — falls back to plain transformers+peft
 # when unavailable. See experiments/shared/model_utils.py.
 # unsloth @ git+https://github.com/unslothai/unsloth.git
@@ -28,3 +35,15 @@ tiktoken>=0.8.0
 # Plotting (already in requirements.txt but pinned higher for nb stability)
 matplotlib>=3.9.0
 seaborn>=0.13.0
+requests>=2.31.0
+openai>=2.38.0
+
+# Eval metrics — BERTScore + ROUGE for inline notebook scoring of generated text.
+evaluate>=0.4.3
+bert-score>=0.3.13
+rouge-score>=0.1.2
+
+# Executed-notebook logging — papermill (offline execute) + nbconvert HTML render + nbformat sanitize.
+papermill>=2.5.0
+nbconvert>=7.0.0
+nbformat>=5.10.0
