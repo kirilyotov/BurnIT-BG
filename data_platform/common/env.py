@@ -47,7 +47,7 @@ def detect_runtime() -> Runtime:
         # `google.colab` only exists inside the Colab runtime — no pip
         # package — so static checkers can't resolve it. We import for the
         # side-effect of triggering ImportError on non-Colab machines.
-        import google.colab  # type: ignore[import-not-found]  # pylint: disable=import-error,no-name-in-module,unused-import  # noqa: F401
+        import google.colab
         return "colab"
     except ImportError:
         return "local"
