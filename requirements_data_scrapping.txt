@@ -2,3 +2,8 @@
 -r requirements_package.txt
 requests==2.33.1
 feedparser==6.0.12
+# Book content extraction (EPUB/FB2/TXT/PDF → paragraphs)
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+pypdf>=4.3.0
+duckdb>=1.0.0

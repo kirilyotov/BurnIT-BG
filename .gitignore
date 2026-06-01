@@ -209,3 +209,12 @@ __marimo__/
 # Runtime scratch for data_scraping pipeline (DuckDB store + streamed downloads)
 tmp/
 
+# Unsloth runtime cache. Unsloth writes compiled Triton / MoE helper modules
+# (moe_utils.py, etc.) into a folder relative to the CWD when a model first
+# loads, so it can end up next to a notebook, at the repo root, or anywhere
+# we cd into. Safe to delete; will be regenerated on the next run.
+unsloth_compiled_cache/
+**/unsloth_compiled_cache/
+
+.idea/**
+.vscode/**
