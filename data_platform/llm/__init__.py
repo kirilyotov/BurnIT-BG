@@ -6,7 +6,9 @@ from .nvidia_client import (
     NvidiaChatClient,
     NvidiaChatError,
     NvidiaModel,
+    RpmBucket,
     extract_json,
+    get_bucket,
 )
 
 __all__ = [
@@ -14,5 +16,7 @@ __all__ = [
     "NvidiaChatClient",
     "NvidiaChatError",
     "NvidiaModel",
+    "RpmBucket",
     "extract_json",
+    "get_bucket",
 ]

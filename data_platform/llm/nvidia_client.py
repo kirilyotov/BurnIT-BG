@@ -1,22 +1,17 @@
 """Thin client for NVIDIA-hosted, OpenAI-compatible chat models.
 
-Every model we use (Mistral Large 3 as a generator/quality judge, Llama
-Guard 4 and Nemotron Content Safety as safety classifiers) is served from
-the same endpoint — ``https://integrate.api.nvidia.com/v1/chat/completions``
-— with a per-model bearer token read from the environment. The raw,
-copy-pasteable calls this wraps live in ``api_judges_scripts/``.
-
-The client is deliberately small: a ``chat`` method that returns the
-assistant text, a ``chat_json`` helper that parses a JSON object out of
-that text, retries on rate-limit/5xx, and a registry of the models we use.
-
+All models (Mistral Large 3, Llama Guard 4, Nemotron Content Safety) share
+one endpoint with a per-model bearer token from env. Exposes ``chat`` (text),
+``chat_json`` (parsed JSON), retries on 429/5xx, and a model registry.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +19,63 @@ from typing import Any
 import requests
 
 NVIDIA_INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Rate limiting — pre-emptive token bucket
+# ────────────────────────────────────────────────────────────────────────────
+# NVIDIA's free tier is ~40 RPM per key. 429s have no Retry-After, so we pace
+# requests up-front. One shared bucket per (model, rpm) covers all clients
+# and parallel scorer threads on that key.
+
+_BUCKETS_LOCK = threading.Lock()
+_BUCKETS: dict[str, "RpmBucket"] = {}
+
+
+class RpmBucket:
+    """Token bucket: refills at ``rpm`` tokens per minute, with a small burst."""
+
+    def __init__(self, rpm: float, burst: float | None = None) -> None:
+        self.rpm = float(rpm)
+        self.refill_per_sec = self.rpm / 60.0
+        # Allow a small burst so multi-judge panels don't trickle one-by-one.
+        self.capacity = float(burst if burst is not None else max(3.0, rpm / 8.0))
+        self._tokens = self.capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill_locked(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last
+        if elapsed > 0:
+            self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_per_sec)
+            self._last = now
+
+    def acquire(self, tokens: float = 1.0) -> None:
+        """Block until at least ``tokens`` are available."""
+        while True:
+            with self._lock:
+                self._refill_locked()
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                deficit = tokens - self._tokens
+                wait = deficit / self.refill_per_sec
+            # Sleep OUTSIDE the lock so other threads can refill too.
+            time.sleep(min(wait, 0.5))
+
+
+def get_bucket(key: str, rpm: float) -> RpmBucket:
+    """Return the process-wide shared bucket for ``key`` (e.g. a model handle).
+
+    Once a bucket is created the rpm is fixed — subsequent calls with the same
+    key ignore the rpm argument. This is intentional: we never want two
+    competing buckets racing against the same upstream rate limit.
+    """
+    with _BUCKETS_LOCK:
+        if key not in _BUCKETS:
+            _BUCKETS[key] = RpmBucket(rpm)
+        return _BUCKETS[key]
 
 
 @dataclass(frozen=True)
@@ -102,6 +154,7 @@ class NvidiaChatClient:
         timeout: float = 90.0,
         max_retries: int = 4,
         base_delay: float = 2.0,
+        rpm: float | None = None,
     ) -> None:
         if isinstance(model, str):
             if model not in MODELS:
@@ -118,6 +171,16 @@ class NvidiaChatClient:
             raise NvidiaChatError(
                 f"Missing API key: set {model.api_key_env} in your environment / .env"
             )
+        # Pre-emptive rate limit. NVIDIA free tier is ~40 RPM per key — pick a
+        # default well below to leave room for retries. Buckets are shared
+        # process-wide per model_id so parallel scorers from
+        # mlflow.genai.evaluate cooperate instead of stampeding.
+        if rpm is None:
+            env_rpm = os.getenv("NVIDIA_DEFAULT_RPM")
+            rpm = float(env_rpm) if env_rpm else 30.0
+        self.rate_bucket: RpmBucket | None = (
+            get_bucket(model.model_id, rpm) if rpm and rpm > 0 else None
+        )
 
     def chat(
         self,
@@ -147,20 +210,31 @@ class NvidiaChatClient:
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
+            # Pre-emptive throttle — wait for a token BEFORE we hit the wire.
+            # Saves a failed 429 round-trip that would otherwise count against
+            # the same per-minute budget.
+            if self.rate_bucket is not None:
+                self.rate_bucket.acquire()
             try:
                 resp = requests.post(
                     NVIDIA_INVOKE_URL, headers=headers, json=payload, timeout=self.timeout
                 )
                 if resp.status_code == 429:
-                    # Honor Retry-After when present (seconds or HTTP-date); fall
-                    # back to a longer base delay for rate limits than for 5xx.
+                    # NVIDIA's NIM endpoints DO NOT reliably set Retry-After,
+                    # so we use exponential backoff with FULL JITTER (the AWS
+                    # "Architecture Blog" pattern). Without jitter, multiple
+                    # parallel scorer threads all retry at the same moment and
+                    # immediately re-trigger 429s. Honor Retry-After when
+                    # present, otherwise jitter our own backoff.
                     retry_after = self._parse_retry_after(resp.headers.get("Retry-After"))
-                    wait = retry_after if retry_after is not None else max(
-                        self.base_delay * (2**attempt), 15.0,
-                    )
+                    if retry_after is not None:
+                        wait = retry_after + random.uniform(0.0, 0.5)
+                    else:
+                        cap = max(self.base_delay * (2**attempt), 15.0)
+                        wait = random.uniform(0.0, cap)
                     last_exc = NvidiaChatError(
-                        f"HTTP 429 Too Many Requests (retry after {wait:.1f}s): "
-                        f"{resp.text[:160]}"
+                        f"HTTP 429 Too Many Requests (retry in {wait:.1f}s, "
+                        f"attempt {attempt + 1}/{self.max_retries}): {resp.text[:160]}"
                     )
                     if attempt < self.max_retries - 1:
                         time.sleep(wait)
