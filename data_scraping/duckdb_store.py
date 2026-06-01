@@ -22,7 +22,7 @@ class DuckDBStore:
 
     def _ensure_schema(self):
         """
-        Create the manifest table if it does not exist.
+        Create the manifest + passages tables if they do not exist.
         """
         self.conn.execute('''
         CREATE TABLE IF NOT EXISTS manifest (
@@ -46,6 +46,60 @@ class DuckDBStore:
             PRIMARY KEY (source, entry_id)
         )
         ''')
+        self.conn.execute('''
+        CREATE TABLE IF NOT EXISTS passages (
+            passage_id VARCHAR PRIMARY KEY,
+            source VARCHAR,
+            book_id VARCHAR,
+            book_title VARCHAR,
+            authors VARCHAR,
+            topic VARCHAR,
+            keywords_matched VARCHAR,
+            text VARCHAR,
+            language VARCHAR,
+            paragraph_index INTEGER,
+            char_offset BIGINT,
+            length_chars INTEGER,
+            chapter_title VARCHAR,
+            book_minio_key VARCHAR,
+            extracted_at VARCHAR,
+            extraction_date VARCHAR
+        )
+        ''')
+
+    def upsert_passage(self, record: Dict[str, Any]):
+        """Insert/upsert a passage record (keyed by passage_id)."""
+        keywords = json.dumps(record.get("keywords_matched", []), ensure_ascii=False)
+        authors  = record.get("authors")
+        if isinstance(authors, list):
+            authors = json.dumps(authors, ensure_ascii=False)
+        self.conn.execute('''
+        INSERT INTO passages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(passage_id) DO UPDATE SET
+            topic=excluded.topic,
+            keywords_matched=excluded.keywords_matched,
+            text=excluded.text,
+            length_chars=excluded.length_chars,
+            extracted_at=excluded.extracted_at,
+            extraction_date=excluded.extraction_date
+        ''', [
+            record.get("passage_id"),
+            record.get("source"),
+            record.get("book_id"),
+            record.get("book_title"),
+            authors,
+            record.get("topic"),
+            keywords,
+            record.get("text"),
+            record.get("language"),
+            record.get("paragraph_index"),
+            record.get("char_offset"),
+            record.get("length_chars"),
+            record.get("chapter_title"),
+            record.get("book_minio_key"),
+            record.get("extracted_at"),
+            record.get("extraction_date"),
+        ])
 
     def upsert_manifest_record(self, record: Dict[str, Any]):
         """
