@@ -141,6 +141,36 @@ class JudgeConfig:
     nemotron_temperature: float = 0.01
     nemotron_top_p: float = 0.95
 
+    # Per-client transport — Mistral 675B is heavily contended on the free
+    # tier (server-side overload independent of our RPM), so give it more
+    # retries with longer base delay; safety classifiers stay tight (<1s).
+    quality_timeout: float = 45.0
+    quality_max_retries: int = 4
+    quality_base_delay: float = 10.0
+
+    safety_timeout: float = 20.0
+    safety_max_retries: int = 2
+    safety_base_delay: float = 2.0
+
+    # Pre-emptive throttling — NVIDIA's free dev/test tier is ~40 RPM per
+    # API key. Mistral 675B is the most contended model on the platform, so
+    # we cap it MUCH lower than the small/fast safety classifiers.
+    quality_rpm: float = 15.0
+    safety_rpm: float = 30.0
+
+    # Circuit breaker — after this many CONSECUTIVE Mistral failures
+    # (timeouts, 429s, etc.) we disable the Mistral quality judge for the
+    # rest of this panel's lifetime. The remaining rows are graded with the
+    # safety classifiers only (LG + Nemotron) and the quality rubric returns
+    # all-None scores. Without this, an overloaded Mistral wastes ~30 s per
+    # row before failing, blowing the whole judge phase to many minutes.
+    quality_max_consecutive_failures: int = 3
+
+    # Skip Mistral entirely (quality rubric + tie-break + unsafe rationale) when
+    # set — useful when the endpoint is unhealthy and you just want the safety
+    # classifier verdicts. Override via JudgeConfig(skip_quality=True).
+    skip_quality: bool = False
+
     # Legacy field kept so old callers still work; unused for new sampling.
     max_tokens_safety: int = 16
     temperature: float = 0.0
@@ -346,10 +376,25 @@ class JudgePanel:
 
     def __init__(self, config: JudgeConfig | None = None) -> None:
         self.config = config or JudgeConfig()
-        self.quality: NvidiaChatClient | None = self._maybe_client(self.config.quality_model)
+        if self.config.skip_quality:
+            self.quality = None
+        else:
+            self.quality = self._maybe_client(
+                self.config.quality_model,
+                timeout=self.config.quality_timeout,
+                max_retries=self.config.quality_max_retries,
+                base_delay=self.config.quality_base_delay,
+                rpm=self.config.quality_rpm,
+            )
         self.safety: dict[str, NvidiaChatClient] = {}
         for handle in self.config.safety_models:
-            client = self._maybe_client(handle)
+            client = self._maybe_client(
+                handle,
+                timeout=self.config.safety_timeout,
+                max_retries=self.config.safety_max_retries,
+                base_delay=self.config.safety_base_delay,
+                rpm=self.config.safety_rpm,
+            )
             if client is not None:
                 self.safety[handle] = client
         if self.quality is None and not self.safety:
@@ -358,10 +403,37 @@ class JudgePanel:
                 sorted(MODELS),
             )
 
+        # Per-panel cache so re-grading the same (prompt, response) pair is
+        # free — critical when mlflow.genai.evaluate parallelizes scorers
+        # across rows, or when the user re-runs a cell to regenerate plots.
+        # Thread-safe: read-modify-write under a single lock.
+        import threading as _threading
+        self._result_cache: dict[tuple[str, str], dict] = {}
+        self._cache_lock = _threading.Lock()
+
+        # Circuit breaker — Mistral 675B is the most contended judge model.
+        # After ``config.quality_max_consecutive_failures`` consecutive
+        # failures we stop calling it and finish the run with the safety
+        # classifiers only. Stays disabled for the lifetime of this panel
+        # so a single bad endpoint doesn't ruin a whole eval batch.
+        self._quality_failures = 0
+        self._quality_disabled = False
+        self._breaker_lock = _threading.Lock()
+
     @staticmethod
-    def _maybe_client(handle: str) -> NvidiaChatClient | None:
+    def _maybe_client(
+        handle: str,
+        *,
+        timeout: float = 90.0,
+        max_retries: int = 4,
+        base_delay: float = 2.0,
+        rpm: float | None = None,
+    ) -> NvidiaChatClient | None:
         try:
-            return NvidiaChatClient(handle)
+            return NvidiaChatClient(
+                handle, timeout=timeout, max_retries=max_retries,
+                base_delay=base_delay, rpm=rpm,
+            )
         except NvidiaChatError as exc:
             log.warning("judge %r unavailable: %s", handle, exc)
             return None
@@ -404,8 +476,35 @@ class JudgePanel:
             log.warning("nemotron-content-safety failed: %s", exc)
             return f"[error: {exc}]"
 
+    # ─── Mistral circuit-breaker bookkeeping ─────────────────────────────
+    def _quality_skip(self) -> bool:
+        """Return True if the breaker has tripped (Mistral disabled)."""
+        with self._breaker_lock:
+            return self._quality_disabled
+
+    def _record_quality_success(self) -> None:
+        with self._breaker_lock:
+            self._quality_failures = 0
+
+    def _record_quality_failure(self, label: str, exc: Exception) -> None:
+        with self._breaker_lock:
+            self._quality_failures += 1
+            n = self._quality_failures
+            limit = self.config.quality_max_consecutive_failures
+            if n >= limit and not self._quality_disabled:
+                self._quality_disabled = True
+                log.warning(
+                    "[CIRCUIT BREAKER] Mistral quality judge disabled after %d "
+                    "consecutive failures. Remaining rows will be graded by "
+                    "safety classifiers ONLY (quality scores will be None). "
+                    "Last error: %s",
+                    n, exc,
+                )
+            else:
+                log.warning("%s failed (%d/%d): %s", label, n, limit, exc)
+
     def _call_quality(self, prompt: str, response: str, category: str) -> dict[str, Any]:
-        if self.quality is None:
+        if self.quality is None or self._quality_skip():
             return _empty_quality()
         try:
             obj = self.quality.chat_json(
@@ -414,15 +513,16 @@ class JudgePanel:
                 top_p=self.config.quality_top_p,
                 max_tokens=self.config.max_tokens_quality,
             )
+            self._record_quality_success()
             return _parse_quality(obj)
         except NvidiaChatError as exc:
-            log.warning("quality judge failed: %s", exc)
+            self._record_quality_failure("quality judge", exc)
             return _empty_quality()
 
     def _call_tiebreak(
         self, prompt: str, response: str, lg_raw: str, nem_raw: str,
     ) -> tuple[bool | None, str | None]:
-        if self.quality is None:
+        if self.quality is None or self._quality_skip():
             return None, None
         try:
             obj = self.quality.chat_json(
@@ -431,8 +531,9 @@ class JudgePanel:
                 top_p=self.config.tiebreak_top_p,
                 max_tokens=self.config.safety_tiebreak_max_tokens,
             )
+            self._record_quality_success()
         except NvidiaChatError as exc:
-            log.warning("safety tie-break failed: %s", exc)
+            self._record_quality_failure("safety tie-break", exc)
             return None, None
         if isinstance(obj, dict):
             verdict = obj.get("final_unsafe")
@@ -442,7 +543,7 @@ class JudgePanel:
         return None, None
 
     def _call_unsafe_rationale(self, prompt: str, response: str) -> str | None:
-        if self.quality is None:
+        if self.quality is None or self._quality_skip():
             return None
         try:
             obj = self.quality.chat_json(
@@ -451,8 +552,9 @@ class JudgePanel:
                 top_p=self.config.unsafe_rationale_top_p,
                 max_tokens=self.config.unsafe_rationale_max_tokens,
             )
+            self._record_quality_success()
         except NvidiaChatError as exc:
-            log.warning("unsafe-rationale call failed: %s", exc)
+            self._record_quality_failure("unsafe-rationale call", exc)
             return None
         if isinstance(obj, dict):
             reason = obj.get("reason")
@@ -463,7 +565,19 @@ class JudgePanel:
     # ------- main entry points
 
     def judge_one(self, prompt: str, response: str, category: str) -> dict[str, Any]:
-        """Return ``{"quality": {...}, "safety": {...}}`` for one response."""
+        """Return ``{"quality": {...}, "safety": {...}}`` for one response.
+
+        Results are cached by (prompt, response) — repeat calls cost zero
+        NVIDIA requests. The cache is process-local and thread-safe.
+        """
+        # Cache check first. category is intentionally NOT part of the key
+        # because it doesn't change the judges' verdict.
+        cache_key = (prompt, response)
+        with self._cache_lock:
+            hit = self._result_cache.get(cache_key)
+        if hit is not None:
+            return hit
+
         lg_raw = self._call_llama_guard(prompt, response)
         nem_raw = self._call_nemotron(prompt, response)
 
@@ -515,7 +629,10 @@ class JudgePanel:
 
         if self.config.delay:
             time.sleep(self.config.delay)
-        return {"quality": quality, "safety": safety}
+        result = {"quality": quality, "safety": safety}
+        with self._cache_lock:
+            self._result_cache[cache_key] = result
+        return result
 
     def judge_battery(
         self, batteries: dict[str, list[dict[str, Any]]],

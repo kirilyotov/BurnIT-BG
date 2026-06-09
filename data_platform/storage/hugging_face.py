@@ -136,8 +136,16 @@ class HuggingFaceStorage:
         private: bool = False,
         create_repo_if_missing: bool = True,
         commit_message: str = "Upload dataset artifacts",
+        card_data: "huggingface_hub.DatasetCardData | None" = None,
+        card_content: str | None = None,
     ) -> str:
-        """Upload a local dataset directory to a Hugging Face dataset repository."""
+        """Upload a local dataset directory to a Hugging Face dataset repository.
+
+        Optional ``card_data`` attaches a typed YAML front-matter (license,
+        language, task_categories, size_categories, source_datasets, …) so the
+        dataset shows up correctly in the HF datasets viewer / search facets.
+        Optional ``card_content`` is the markdown body appended after the YAML.
+        """
 
         local_path = Path(local_dir)
         if not local_path.exists() or not local_path.is_dir():
@@ -146,6 +154,13 @@ class HuggingFaceStorage:
         try:
             if create_repo_if_missing:
                 self.api.create_repo(repo_id=dataset_id, repo_type="dataset", private=private, exist_ok=True)
+
+            if card_data is not None or card_content is not None:
+                from huggingface_hub import DatasetCard, DatasetCardData
+                cd = card_data if card_data is not None else DatasetCardData()
+                body = card_content or f"# {dataset_id}\n"
+                card = DatasetCard(f"---\n{cd.to_yaml()}\n---\n{body}")
+                card.push_to_hub(dataset_id, token=self.token)
 
             self.api.upload_folder(
                 folder_path=str(local_path),
