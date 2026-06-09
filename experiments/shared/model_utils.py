@@ -23,6 +23,8 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+LLAMA_MODEL = DEFAULT_MODEL_NAME
+GEMMA3_MODEL = "INSAIT-Institute/BgGPT-Gemma-3-4B-IT"
 DEFAULT_MAX_SEQ_LENGTH = 2048
 DEFAULT_LORA_R = 16
 DEFAULT_LORA_ALPHA = 32

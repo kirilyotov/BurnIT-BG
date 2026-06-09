@@ -397,7 +397,26 @@ class JudgePanel:
             )
             if client is not None:
                 self.safety[handle] = client
+        # Status banner — VISIBLE on Colab (print, not log) so the user
+        # knows up front which judges are actually live. Without this the
+        # only signal a missing API key gives is all-null verdicts after a
+        # 5-minute inference run.
+        from data_platform.llm.nvidia_client import MODELS as _MODELS
+        statuses = []
+        wanted = ([self.config.quality_model] if not self.config.skip_quality else []) + list(self.config.safety_models)
+        for handle in wanted:
+            live = (handle == self.config.quality_model and self.quality is not None) \
+                or (handle in self.safety)
+            env_name = _MODELS[handle].api_key_env if handle in _MODELS else "?"
+            mark = "OK " if live else "MISSING"
+            statuses.append(f"  {mark}  {handle:<26} (env: {env_name})")
+        print("[judges] panel status:")
+        for line in statuses:
+            print(line)
+
         if self.quality is None and not self.safety:
+            print("[judges] ⚠  NO usable judges — every verdict will be null. "
+                  "Set the missing API keys above in your env / Colab Secrets.")
             log.warning(
                 "JudgePanel has no usable judges — check API keys for %s",
                 sorted(MODELS),
@@ -435,6 +454,9 @@ class JudgePanel:
                 base_delay=base_delay, rpm=rpm,
             )
         except NvidiaChatError as exc:
+            # Print AND log so the failure shows up on Colab even when only
+            # WARNING-level log handlers are noisy.
+            print(f"[judges] {handle!r} unavailable: {exc}")
             log.warning("judge %r unavailable: %s", handle, exc)
             return None
 

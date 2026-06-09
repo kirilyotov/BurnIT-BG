@@ -56,6 +56,69 @@ class LoadedDataset:
         return mlflow.data.from_pandas(df, source=self.source_uri, name=ds_name)
 
 
+_ALPACA_KEYS = ("instruction", "input", "output")
+# Common alternative column names found across mental-health corpora.
+_INSTRUCTION_ALIASES = (
+    "instruction", "Context", "context", "question", "Question", "prompt",
+    "Prompt", "user", "User", "human", "Human", "input_text",
+)
+_OUTPUT_ALIASES = (
+    "output", "Response", "response", "answer", "Answer", "completion",
+    "assistant", "Assistant", "bot", "output_text",
+)
+
+
+def _normalize_to_alpaca(rec: dict[str, Any]) -> dict[str, Any]:
+    """Map heterogeneous QA-record column names to ``instruction/input/output``.
+
+    Keeps the original keys around in ``metadata`` so nothing is lost — just
+    ensures every record carries the canonical Alpaca shape the trainer and
+    judge panel both expect.
+    """
+    if all(k in rec for k in _ALPACA_KEYS):
+        return rec
+    out_rec: dict[str, Any] = {}
+    instr_val: str | None = None
+    out_val: str | None = None
+    for k in _INSTRUCTION_ALIASES:
+        if k in rec and rec[k]:
+            instr_val = str(rec[k])
+            break
+    for k in _OUTPUT_ALIASES:
+        if k in rec and rec[k]:
+            out_val = str(rec[k])
+            break
+    out_rec["instruction"] = instr_val or rec.get("instruction") or ""
+    out_rec["input"] = rec.get("input", "")
+    out_rec["output"] = out_val or rec.get("output") or ""
+    # Preserve everything else as metadata for inspection.
+    extras = {k: v for k, v in rec.items() if k not in {"instruction", "input", "output"}
+              and k not in _INSTRUCTION_ALIASES and k not in _OUTPUT_ALIASES}
+    if extras:
+        out_rec["metadata"] = extras
+    return out_rec
+
+
+def _looks_like_registry_id(name: Any) -> bool:
+    """Return True if ``name`` (string or list) refers to a registry id.
+
+    Treats either an explicit comma-separated string of registry ids or a list
+    that contains at least one known id as registry-routed. Pure single-name
+    strings still need ``source="registry"`` to disambiguate from raw HF repo
+    ids that happen to be alphanumeric.
+    """
+    try:
+        from experiments.shared.datasets_registry import BY_ID
+    except Exception:
+        return False
+    if isinstance(name, str) and "," in name:
+        ids = [t.strip() for t in name.split(",") if t.strip()]
+        return any(i in BY_ID for i in ids)
+    if isinstance(name, list):
+        return any(isinstance(t, str) and t in BY_ID for t in name)
+    return False
+
+
 def get_dataset(
     name: str,
     *,
@@ -66,6 +129,8 @@ def get_dataset(
     eval_fallback_take: int = 200,
     shuffle: bool = True,
     shuffle_seed: int = 42,
+    file: str | None = None,
+    eval_split_ratio: float = 0.1,
 ) -> LoadedDataset:
     """Load one or more datasets by name + source.
 
@@ -97,6 +162,69 @@ def get_dataset(
         deterministic shuffle. Disable for ordered concatenation.
     """
     source = source.lower()
+
+    # ── Registry lookup ──────────────────────────────────────────────────
+    # source="registry" (or a comma-separated string of registry ids)
+    # resolves to one or more DatasetSpec entries from datasets_registry.
+    if source == "registry" or _looks_like_registry_id(name):
+        from experiments.shared.datasets_registry import resolve_dataset_spec
+
+        if isinstance(name, str) and "," in name:
+            ids = [n.strip() for n in name.split(",") if n.strip()]
+        elif isinstance(name, list):
+            ids = [str(n).strip() for n in name if str(n).strip()]
+        else:
+            ids = [name if isinstance(name, str) else name]  # type: ignore[list-item]
+
+        specs = [resolve_dataset_spec(t) for t in ids]
+        if len(specs) == 1:
+            s = specs[0]
+            return get_dataset(
+                s.location,
+                source=s.source,
+                subset=s.subset or subset,
+                split_train=split_train,
+                split_eval=split_eval,
+                eval_fallback_take=eval_fallback_take,
+                file=s.file,
+                shuffle=shuffle,
+                shuffle_seed=shuffle_seed,
+            )
+        # Multi-spec: load each, concat, shuffle.
+        import random
+        parts = [
+            get_dataset(
+                s.location,
+                source=s.source,
+                subset=s.subset or subset,
+                split_train=split_train,
+                split_eval=split_eval,
+                eval_fallback_take=eval_fallback_take,
+                file=s.file,
+                shuffle=False,
+            )
+            for s in specs
+        ]
+        train: list[dict[str, Any]] = []
+        eval_: list[dict[str, Any]] = []
+        per_source: dict[str, int] = {}
+        for s, p in zip(specs, parts):
+            train.extend(p.train)
+            eval_.extend(p.eval)
+            per_source[s.id] = len(p.train)
+        if shuffle:
+            rng = random.Random(shuffle_seed)
+            rng.shuffle(train)
+            rng.shuffle(eval_)
+        return LoadedDataset(
+            train=train,
+            eval=eval_,
+            name="+".join(s.id for s in specs),
+            source="registry",
+            source_uri=";".join(f"{s.source}://{s.location}" for s in specs),
+            subset=subset,
+            extras={"per_source": per_source, "specs": [s.id for s in specs]},
+        )
 
     # Multi-dataset fan-out: comma-separated names or an explicit list.
     if isinstance(name, str) and "," in name:
@@ -144,6 +272,47 @@ def get_dataset(
     # Normalize single-name case.
     if names and len(names) == 1:
         name = names[0]
+
+    if source == "hf-bucket":
+        # HF *Buckets* are flat blob storage — not HF Datasets. We download
+        # the specific ``file`` from bucket id ``name`` (e.g. ``"kiplayo/data"``),
+        # parse the jsonl, and do a deterministic 90/10 train/eval split.
+        import json
+        import random
+        import tempfile
+
+        from data_platform.storage.hugging_face import HuggingFaceStorage
+
+        if not file:
+            raise ValueError(
+                'source="hf-bucket" requires file=<path-in-bucket> '
+                '(e.g. file="datasets/chitanka/bg/dataset.jsonl")'
+            )
+        storage = HuggingFaceStorage.from_env()
+        tmp = Path(tempfile.mkdtemp(prefix="hf_bucket_"))
+        local_path = tmp / Path(file).name
+        storage.load_file_from_bucket(name, file, str(local_path))
+
+        records: list[dict[str, Any]] = []
+        with open(local_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    records.append(_normalize_to_alpaca(json.loads(line)))
+
+        rng = random.Random(shuffle_seed)
+        rng.shuffle(records)
+        cut = max(1, int(len(records) * (1.0 - eval_split_ratio)))
+        train, eval_ = records[:cut], records[cut:]
+        return LoadedDataset(
+            train=train,
+            eval=eval_,
+            name=f"{name}/{file}",
+            source="hf-bucket",
+            source_uri=f"hf-bucket://{name}/{file}",
+            subset=subset,
+            extras={"local_path": str(local_path), "total_records": len(records)},
+        )
 
     if source == "hf":
         from datasets import load_dataset
