@@ -144,19 +144,16 @@ class JudgeConfig:
     # Per-client transport — Mistral 675B is heavily contended on the free
     # tier (server-side overload independent of our RPM), so give it more
     # retries with longer base delay; safety classifiers stay tight (<1s).
-    quality_timeout: float = 45.0
-    quality_max_retries: int = 4
-    quality_base_delay: float = 10.0
+    quality_timeout: float = 180.0
+    quality_max_retries: int = 5
+    quality_base_delay: float = 12.0
 
     safety_timeout: float = 20.0
     safety_max_retries: int = 2
     safety_base_delay: float = 2.0
 
-    # Pre-emptive throttling — NVIDIA's free dev/test tier is ~40 RPM per
-    # API key. Mistral 675B is the most contended model on the platform, so
-    # we cap it MUCH lower than the small/fast safety classifiers.
-    quality_rpm: float = 15.0
-    safety_rpm: float = 30.0
+    quality_rpm: float = 6.0
+    safety_rpm: float = 20.0
 
     # Circuit breaker — after this many CONSECUTIVE Mistral failures
     # (timeouts, 429s, etc.) we disable the Mistral quality judge for the
@@ -164,7 +161,7 @@ class JudgeConfig:
     # safety classifiers only (LG + Nemotron) and the quality rubric returns
     # all-None scores. Without this, an overloaded Mistral wastes ~30 s per
     # row before failing, blowing the whole judge phase to many minutes.
-    quality_max_consecutive_failures: int = 3
+    quality_max_consecutive_failures: int = 4
 
     # Skip Mistral entirely (quality rubric + tie-break + unsafe rationale) when
     # set — useful when the endpoint is unhealthy and you just want the safety
@@ -510,10 +507,17 @@ class JudgePanel:
 
     def _record_quality_failure(self, label: str, exc: Exception) -> None:
         with self._breaker_lock:
+            # Once the breaker is open, stop counting and stop emitting the
+            # "(n/limit)" warnings. Without this guard, in-flight Mistral
+            # calls that started before the breaker latched keep incrementing
+            # the counter past the threshold (the "(4/3)", "(5/3)" warnings
+            # you saw mid-run).
+            if self._quality_disabled:
+                return
             self._quality_failures += 1
             n = self._quality_failures
             limit = self.config.quality_max_consecutive_failures
-            if n >= limit and not self._quality_disabled:
+            if n >= limit:
                 self._quality_disabled = True
                 log.warning(
                     "[CIRCUIT BREAKER] Mistral quality judge disabled after %d "
@@ -953,7 +957,17 @@ def judge_and_log(
     Returns ``{"judged": ..., "summary": ...}``. Call inside an active
     ``tracking.run(...)`` block, right after ``log_responses``.
     """
-    panel = panel or JudgePanel()
+    # Share the singleton panel with the mlflow_judges scorers so the
+    # circuit breaker, RPM bucket, and result cache are all common between
+    # path A (this call) and path B (mlflow.genai.evaluate). Without this,
+    # each path independently retries every row through Mistral 675B and
+    # the free-tier rate limit kills both halves of the run.
+    if panel is None:
+        try:
+            from experiments.shared.mlflow_judges import _get_panel
+            panel = _get_panel()
+        except Exception:
+            panel = JudgePanel()
     result = panel.judge_battery(batteries)
     summary = result["summary"]
 

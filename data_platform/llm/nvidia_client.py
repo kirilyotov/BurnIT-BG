@@ -39,7 +39,7 @@ class RpmBucket:
         self.rpm = float(rpm)
         self.refill_per_sec = self.rpm / 60.0
         # Allow a small burst so multi-judge panels don't trickle one-by-one.
-        self.capacity = float(burst if burst is not None else max(3.0, rpm / 8.0))
+        self.capacity = float(burst if burst is not None else max(1.0, rpm / 30.0))
         self._tokens = self.capacity
         self._last = time.monotonic()
         self._lock = threading.Lock()
@@ -152,7 +152,7 @@ class NvidiaChatClient:
         model: str | NvidiaModel,
         *,
         timeout: float = 90.0,
-        max_retries: int = 4,
+        max_retries: int = 6,
         base_delay: float = 2.0,
         rpm: float | None = None,
     ) -> None:
@@ -227,29 +227,40 @@ class NvidiaChatClient:
                 if resp.status_code == 429:
                     # NVIDIA's NIM endpoints DO NOT reliably set Retry-After,
                     # so we use exponential backoff with FULL JITTER (the AWS
-                    # "Architecture Blog" pattern). Without jitter, multiple
-                    # parallel scorer threads all retry at the same moment and
-                    # immediately re-trigger 429s. Honor Retry-After when
+                    # "Architecture Blog" pattern). Honor Retry-After when
                     # present, otherwise jitter our own backoff.
                     retry_after = self._parse_retry_after(resp.headers.get("Retry-After"))
                     if retry_after is not None:
-                        wait = retry_after + random.uniform(0.0, 0.5)
+                        wait = min(retry_after + random.uniform(0.0, 0.5), 60.0)
                     else:
-                        cap = max(self.base_delay * (2**attempt), 15.0)
-                        wait = random.uniform(0.0, cap)
+                        cap = min(max(self.base_delay * (2**attempt), 15.0), 60.0)
+                        wait = random.uniform(self.base_delay, cap)
+                    is_last = attempt >= self.max_retries - 1
                     last_exc = NvidiaChatError(
-                        f"HTTP 429 Too Many Requests (retry in {wait:.1f}s, "
+                        f"HTTP 429 Too Many Requests "
+                        f"({'no more retries' if is_last else f'retry in {wait:.1f}s'}, "
                         f"attempt {attempt + 1}/{self.max_retries}): {resp.text[:160]}"
                     )
-                    if attempt < self.max_retries - 1:
-                        time.sleep(wait)
+                    if is_last:
+                        break
+                    time.sleep(wait)
                     continue
                 if resp.status_code >= 500:
+                    # Apply jitter here too — deterministic 2^N backoff plus
+                    # multiple parallel scorer threads = thundering herd on
+                    # 503 storms. Honor Retry-After when NVIDIA bothers to set it.
+                    retry_after = self._parse_retry_after(resp.headers.get("Retry-After"))
+                    cap = min(max(self.base_delay * (2**attempt), 10.0), 30.0)
+                    wait = retry_after if retry_after is not None else random.uniform(self.base_delay, cap)
+                    is_last = attempt >= self.max_retries - 1
                     last_exc = NvidiaChatError(
-                        f"transient HTTP {resp.status_code}: {resp.text[:200]}"
+                        f"transient HTTP {resp.status_code} "
+                        f"({'no more retries' if is_last else f'retry in {wait:.1f}s'}): "
+                        f"{resp.text[:200]}"
                     )
-                    if attempt < self.max_retries - 1:
-                        time.sleep(self.base_delay * (2**attempt))
+                    if is_last:
+                        break
+                    time.sleep(wait)
                     continue
                 # 401: don't retry, but emit a one-line diagnostic with key
                 # length + masked head/tail so the user can tell at a glance
