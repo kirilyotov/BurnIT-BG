@@ -44,6 +44,49 @@ def _try_import_unsloth() -> Any:
 QUANTIZATIONS = ("4bit", "8bit", "none", "bf16", "fp16")
 
 
+_GEMMA3_LEGACY_ATTRS = (
+    "max_position_embeddings", "hidden_size", "intermediate_size",
+    "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "vocab_size", "head_dim", "rms_norm_eps", "rope_theta", "rope_scaling",
+    "attention_bias", "attention_dropout", "hidden_activation", "tie_word_embeddings",
+)
+
+
+def _patch_gemma3_config_for_legacy_attrs() -> None:
+    """Make ``Gemma3Config.foo`` transparently fall back to ``text_config.foo``.
+
+    Gemma 3 is multimodal — its language-model hyperparameters live on
+    ``config.text_config``, not on the root config. Unsloth (and some older
+    transformers paths) still read them from the root and raise
+    ``AttributeError: 'Gemma3Config' object has no attribute 'max_position_embeddings'``.
+    The simplest non-invasive fix is to override ``__getattribute__`` so a few
+    well-known legacy attrs proxy through. Idempotent.
+    """
+    try:
+        from transformers.models.gemma3 import Gemma3Config
+    except ImportError:
+        return
+    if getattr(Gemma3Config, "_burnit_legacy_proxy", False):
+        return
+    _orig_getattribute = Gemma3Config.__getattribute__
+
+    def __getattribute__(self, name):  # type: ignore[no-redef]
+        try:
+            return _orig_getattribute(self, name)
+        except AttributeError:
+            if name in _GEMMA3_LEGACY_ATTRS:
+                try:
+                    text_config = _orig_getattribute(self, "text_config")
+                except AttributeError:
+                    raise
+                if text_config is not None and hasattr(text_config, name):
+                    return getattr(text_config, name)
+            raise
+
+    Gemma3Config.__getattribute__ = __getattribute__  # type: ignore[assignment]
+    Gemma3Config._burnit_legacy_proxy = True  # type: ignore[attr-defined]
+
+
 def load_model_unsloth(
     model_name: str = DEFAULT_MODEL_NAME,
     *,
@@ -78,6 +121,11 @@ def load_model_unsloth(
         )
     is_4bit = quantization == "4bit"
     is_8bit = quantization == "8bit"
+
+    # Gemma 3 nests legacy hyperparameters under ``config.text_config``; unsloth
+    # and some transformers paths still read them from the root. Patch once so
+    # ``config.max_position_embeddings`` etc. transparently work.
+    _patch_gemma3_config_for_legacy_attrs()
 
     FastLanguageModel = _try_import_unsloth()
     # Unsloth supports 4bit and full-precision; it does NOT expose 8-bit, so we

@@ -13,6 +13,7 @@ These never duplicate ``data_platform.tracking`` — they compose it.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from contextlib import contextmanager
@@ -69,11 +70,27 @@ def setup_run(
     if mlflow_experiment_name is not None:
         tracking.set_experiment(mlflow_experiment_name)
 
+    # MLflow's auto-source detection on Colab pulls the URL bar, which
+    # gives you garbage like ``source.name=fileId=180HzDK_...``. Override it
+    # with the actual notebook name. Detection chain (no user config needed
+    # in the common case): VSCode global → JupyterLab __session__ → Colab
+    # /api/sessions REST → ipynbname → NOTEBOOK_NAME env → fallback.
+    from experiments.shared.notebook_utils import detect_notebook_name
+    detected, _ = detect_notebook_name()
+    source_name = (
+        detected
+        or os.getenv("MLFLOW_SOURCE_NAME")
+        or f"{experiment}.ipynb"
+    )
+    if detected and not source_name.endswith(".ipynb"):
+        source_name = f"{source_name}.ipynb"
     tags = {
         "experiment": experiment,
         "model": model,
         "stage": stage,
         "commit": _short_git_commit(),
+        "mlflow.source.name": source_name,
+        "mlflow.source.type": "NOTEBOOK",
     }
     if extra_tags:
         tags.update(extra_tags)

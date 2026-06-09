@@ -64,25 +64,86 @@ def get_dataset(
     split_train: str = "train",
     split_eval: str = "validation",
     eval_fallback_take: int = 200,
+    shuffle: bool = True,
+    shuffle_seed: int = 42,
 ) -> LoadedDataset:
-    """Load a dataset by name + source.
+    """Load one or more datasets by name + source.
+
+    Pass multiple names as a comma-separated string (or a list) to concatenate
+    them — useful for training on mental-health + R-Tuning refusal records in
+    one run. Records are interleaved with a deterministic shuffle so a small
+    second dataset doesn't always sit at the tail.
 
     Parameters
     ----------
-    name : str
-        - ``source="hf"``   : HuggingFace repo id (``"org/name"``).
-        - ``source="minio"``: MinIO prefix (``"datasets/processed/mental-health"``).
-        - ``source="local"``: filesystem directory containing ``train.jsonl`` and ``eval.jsonl``.
+    name : str | list[str]
+        - ``source="hf"``   : HuggingFace repo id (``"org/name"``) — or a comma-
+          separated list (``"org/a,org/b"``) to concatenate multiple HF datasets.
+        - ``source="minio"``: MinIO prefix (``"datasets/processed/mental-health"``);
+          multi-source supported too.
+        - ``source="local"``: filesystem directory containing ``train.jsonl`` and
+          ``eval.jsonl``; multi-source supported.
     source : {"hf", "minio", "local"}
     subset : str, optional
         Config name for multi-config HF datasets (e.g. ``"unfiltered.nocontext"`` for TriviaQA).
+        Applied to every name in a multi-dataset load.
     split_train, split_eval : str
         HF split names. Ignored for ``minio``/``local``.
     eval_fallback_take : int
-        If the HF dataset lacks an eval split, slice this many rows off the head
-        of the train split so the Trainer's eval loop still has something.
+        If a single HF dataset lacks an eval split, slice this many rows off the
+        head of train so the Trainer's eval loop still has something.
+    shuffle, shuffle_seed : bool, int
+        When loading multiple datasets, interleave their records with a
+        deterministic shuffle. Disable for ordered concatenation.
     """
     source = source.lower()
+
+    # Multi-dataset fan-out: comma-separated names or an explicit list.
+    if isinstance(name, str) and "," in name:
+        names = [n.strip() for n in name.split(",") if n.strip()]
+    elif isinstance(name, list):
+        names = [str(n).strip() for n in name if str(n).strip()]
+    else:
+        names = None
+
+    if names and len(names) > 1:
+        import random
+        parts = [
+            get_dataset(
+                n,
+                source=source,
+                subset=subset,
+                split_train=split_train,
+                split_eval=split_eval,
+                eval_fallback_take=eval_fallback_take,
+                shuffle=False,
+            )
+            for n in names
+        ]
+        train: list[dict[str, Any]] = []
+        eval_: list[dict[str, Any]] = []
+        per_source: dict[str, int] = {}
+        for p in parts:
+            train.extend(p.train)
+            eval_.extend(p.eval)
+            per_source[p.name] = len(p.train)
+        if shuffle:
+            rng = random.Random(shuffle_seed)
+            rng.shuffle(train)
+            rng.shuffle(eval_)
+        return LoadedDataset(
+            train=train,
+            eval=eval_,
+            name="+".join(names),
+            source=source,
+            source_uri=";".join(p.source_uri for p in parts),
+            subset=subset,
+            extras={"per_source": per_source},
+        )
+
+    # Normalize single-name case.
+    if names and len(names) == 1:
+        name = names[0]
 
     if source == "hf":
         from datasets import load_dataset

@@ -107,6 +107,174 @@ def _detect_vscode_or_jupyter_path() -> str | None:
     return None
 
 
+def _strip_ipynb(name: str) -> str:
+    name = name.strip()
+    if name.lower().endswith(".ipynb"):
+        name = name[: -len(".ipynb")]
+    return name
+
+
+def detect_notebook_name() -> tuple[str | None, str]:
+    """Best-effort detection of the running notebook's basename (no ``.ipynb``).
+
+    Returns ``(name_without_extension, source_label)``. ``name`` is ``None``
+    only when every strategy fails (e.g. plain ``python`` script). The
+    ``source_label`` identifies which path won (``"colab-sessions-api"``,
+    ``"vscode-global"``, …) so callers can debug-print it.
+
+    Strategy order — most-reliable first, no-network checks before HTTP:
+
+    1. VSCode global ``__vsc_ipynb_file__``.
+    2. JupyterLab global ``__session__``.
+    3. Colab Jupyter Server ``/api/sessions`` at ``$COLAB_JUPYTER_IP:$KMP_TARGET_PORT``
+       (with hostname + historical-IP fallbacks).
+    4. ``ipynbname`` pip package (vanilla local Jupyter).
+    5. ``jupyter_server.serverapp.list_running_servers`` + kernel-id match.
+    6. IPython user-ns ``__nbname__`` (rare; cheap).
+    7. ``NOTEBOOK_NAME`` env var — explicit user override, last resort.
+    """
+    import builtins
+    import socket
+    import urllib.parse
+
+    # ── 1) VSCode global ──────────────────────────────────────────────────
+    try:
+        vsc = getattr(builtins, "__vsc_ipynb_file__", None)
+        if isinstance(vsc, str) and vsc:
+            return _strip_ipynb(Path(vsc).name), "vscode-global"
+    except Exception:
+        pass
+
+    # ── 2) JupyterLab __session__ global ──────────────────────────────────
+    try:
+        sess = getattr(builtins, "__session__", None)
+        if isinstance(sess, str) and sess:
+            return _strip_ipynb(Path(sess).name), "jupyter-session-global"
+    except Exception:
+        pass
+
+    # ── 3) Colab /api/sessions HTTP endpoint ──────────────────────────────
+    try:
+        import requests
+    except Exception:
+        requests = None
+
+    if requests is not None:
+        candidates: list[tuple[str, int]] = []
+        ip_env = os.environ.get("COLAB_JUPYTER_IP")
+        port_env = os.environ.get("KMP_TARGET_PORT")
+        if ip_env and port_env:
+            try:
+                candidates.append((ip_env, int(port_env)))
+            except ValueError:
+                pass
+        try:
+            candidates.append((socket.gethostbyname(socket.gethostname()), 9000))
+        except Exception:
+            pass
+        # Historical Colab internal IPs as final fallback.
+        candidates.extend([("172.28.0.12", 9000), ("172.28.0.2", 9000)])
+        # De-dup, preserve order.
+        seen: set[tuple[str, int]] = set()
+        uniq = [c for c in candidates if not (c in seen or seen.add(c))]
+
+        # Learn our kernel id so we pick the right session if multiple are listed.
+        kernel_id: str | None = None
+        try:
+            from ipykernel.connect import get_connection_file
+            cf = os.path.basename(get_connection_file())
+            if cf.startswith("kernel-") and cf.endswith(".json"):
+                kernel_id = cf[len("kernel-"):-len(".json")]
+        except Exception:
+            kernel_id = None
+
+        for ip, port in uniq:
+            try:
+                resp = requests.get(f"http://{ip}:{port}/api/sessions", timeout=2.0)
+                if resp.status_code != 200:
+                    continue
+                sessions = resp.json()
+                if not isinstance(sessions, list) or not sessions:
+                    continue
+                picked = None
+                if kernel_id:
+                    for s in sessions:
+                        if (s.get("kernel") or {}).get("id") == kernel_id:
+                            picked = s
+                            break
+                if picked is None:
+                    picked = sessions[0]
+                raw = picked.get("name") or (picked.get("notebook") or {}).get("name")
+                if not raw:
+                    continue
+                name = urllib.parse.unquote(str(raw))
+                stem = _strip_ipynb(Path(name).name)
+                if stem:
+                    return stem, "colab-sessions-api"
+            except Exception:
+                continue
+
+    # ── 4) ipynbname pip package (vanilla local Jupyter) ──────────────────
+    try:
+        import ipynbname  # type: ignore
+        name = ipynbname.name()
+        if name:
+            return _strip_ipynb(str(name)), "ipynbname"
+    except Exception:
+        pass
+
+    # ── 5) jupyter_server.serverapp + kernel-id match ─────────────────────
+    try:
+        from ipykernel.connect import get_connection_file
+        cf = os.path.basename(get_connection_file())
+        kernel_id = None
+        if cf.startswith("kernel-") and cf.endswith(".json"):
+            kernel_id = cf[len("kernel-"):-len(".json")]
+        servers: list[dict] = []
+        for mod in ("jupyter_server.serverapp", "notebook.notebookapp"):
+            try:
+                m = __import__(mod, fromlist=["list_running_servers"])
+                servers.extend(list(m.list_running_servers()))
+            except Exception:
+                pass
+        if requests is not None and kernel_id and servers:
+            for srv in servers:
+                try:
+                    url = srv["url"] + "api/sessions"
+                    params = {"token": srv["token"]} if srv.get("token") else None
+                    resp = requests.get(url, params=params, timeout=2.0)
+                    if resp.status_code != 200:
+                        continue
+                    for s in resp.json():
+                        if (s.get("kernel") or {}).get("id") == kernel_id:
+                            raw = s.get("name") or (s.get("notebook") or {}).get("name")
+                            if raw:
+                                name = urllib.parse.unquote(str(raw))
+                                return _strip_ipynb(Path(name).name), "jupyter-server-api"
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # ── 6) IPython user-ns __nbname__ heuristic ───────────────────────────
+    try:
+        from IPython import get_ipython  # type: ignore
+        sh = get_ipython()
+        if sh is not None:
+            meta = (getattr(sh, "user_ns", {}) or {}).get("__nbname__")
+            if isinstance(meta, str) and meta:
+                return _strip_ipynb(Path(meta).name), "ipython-user-ns"
+    except Exception:
+        pass
+
+    # ── 7) NOTEBOOK_NAME env var — explicit user override (last resort) ──
+    env_name = os.environ.get("NOTEBOOK_NAME")
+    if env_name:
+        return _strip_ipynb(Path(env_name).name), "env-NOTEBOOK_NAME"
+
+    return None, "unknown"
+
+
 def _fetch_jupyter_rest_ipynb(notebook_path: str | None) -> dict | None:
     """Try the local Jupyter Server REST API. Returns notebook JSON or None."""
     if not notebook_path:
@@ -132,6 +300,35 @@ def _has_outputs(nb_json: dict) -> bool:
     return any(c.get("outputs") for c in cells if c.get("cell_type") == "code")
 
 
+def _sanitize_widgets(nb) -> None:
+    """Strip Jupyter widget metadata that breaks nbformat schema validation.
+
+    Colab + ipywidgets put a ``metadata.widgets`` block on the notebook AND
+    widget-view outputs on cells, but they often miss the required ``state``
+    key. nbconvert validates the schema strictly and raises
+    ``KeyError: 'state'`` mid-render. Easiest fix: drop the widgets blob —
+    the rendered HTML doesn't need it (the widgets are interactive anyway,
+    and dead in a static HTML render).
+    """
+    try:
+        md = getattr(nb, "metadata", None)
+        if md is not None and "widgets" in md:
+            del md["widgets"]
+        for cell in getattr(nb, "cells", []):
+            if cell.get("cell_type") != "code":
+                continue
+            new_outputs = []
+            for out in cell.get("outputs", []):
+                data = out.get("data") or {}
+                # Drop widget-view outputs (they require live widget state).
+                if "application/vnd.jupyter.widget-view+json" in data:
+                    continue
+                new_outputs.append(out)
+            cell["outputs"] = new_outputs
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _render_html(nb_path: Path) -> tuple[Path | None, str]:
     """Render a notebook to HTML. Returns (path_or_None, status string).
 
@@ -151,6 +348,7 @@ def _render_html(nb_path: Path) -> tuple[Path | None, str]:
         from nbconvert import HTMLExporter
 
         nb = nbformat.read(str(nb_path), as_version=4)
+        _sanitize_widgets(nb)
         exporter = HTMLExporter()
         exporter.exclude_input_prompt = False
         exporter.exclude_output_prompt = False
@@ -270,10 +468,24 @@ def log_executed_notebook(
                 "Re-run the cells first, or call with require_outputs=False."
             )
 
-    name = Path(notebook_path or "notebook.ipynb").stem
+    # Pick a meaningful filename. detect_notebook_name() runs a 7-stage
+    # chain: VSCode global → JupyterLab __session__ → Colab /api/sessions →
+    # ipynbname → list_running_servers → __nbname__ → NOTEBOOK_NAME env.
+    # No user config needed in the common case — Colab is detected via
+    # COLAB_JUPYTER_IP + KMP_TARGET_PORT.
+    detected, detect_source = detect_notebook_name()
+    explicit_name = (
+        detected
+        or (Path(notebook_path).stem if notebook_path else None)
+        or os.getenv("MLFLOW_RUN_NAME")
+        or "notebook"
+    )
+    say(f"[publish_notebook] notebook name = {explicit_name!r}  (via {detect_source})")
+    name = Path(explicit_name).stem
     tmp = Path(tempfile.mkdtemp(prefix="exec_nb_"))
     nb_path = tmp / f"{name}.ipynb"
     nb = nbformat.from_dict(nb_json) if isinstance(nb_json, dict) else nbformat.reads(json.dumps(nb_json), as_version=4)
+    _sanitize_widgets(nb)
     nbformat.write(nb, str(nb_path))
     tracking.save_data(nb_path, artifact_path=artifact_subdir)
     say(f"[publish_notebook] uploaded .ipynb -> artifact://{artifact_subdir}/{nb_path.name}")
