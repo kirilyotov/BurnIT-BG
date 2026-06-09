@@ -123,8 +123,13 @@ def _load_from_colab(keys: Iterable[str], override: bool) -> dict[str, str]:
                 break
         if value is None:
             continue
-        os.environ[key] = str(value)
-        loaded[key] = str(value)
+        # Strip whitespace — copying from a browser often picks up a trailing
+        # newline. python-dotenv does this automatically for .env files; we
+        # mirror that for Colab Secrets so a paste error doesn't cause silent
+        # 401s ("Bearer <key>\n" gets rejected by most APIs).
+        cleaned = str(value).strip()
+        os.environ[key] = cleaned
+        loaded[key] = cleaned
     return loaded
 
 

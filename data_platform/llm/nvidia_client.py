@@ -166,11 +166,16 @@ class NvidiaChatClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.base_delay = base_delay
-        self.api_key = os.getenv(model.api_key_env)
-        if not self.api_key:
+        raw_key = os.getenv(model.api_key_env)
+        if not raw_key:
             raise NvidiaChatError(
                 f"Missing API key: set {model.api_key_env} in your environment / .env"
             )
+        # Strip whitespace — pasted-from-browser keys frequently carry a
+        # trailing newline, which makes the Bearer header `"Bearer <key>\n"`
+        # and NVIDIA rejects with 401. python-dotenv strips this for .env
+        # files; we mirror that for env vars sourced from Colab Secrets.
+        self.api_key = raw_key.strip()
         # Pre-emptive rate limit. NVIDIA free tier is ~40 RPM per key — pick a
         # default well below to leave room for retries. Buckets are shared
         # process-wide per model_id so parallel scorers from
@@ -246,6 +251,21 @@ class NvidiaChatClient:
                     if attempt < self.max_retries - 1:
                         time.sleep(self.base_delay * (2**attempt))
                     continue
+                # 401: don't retry, but emit a one-line diagnostic with key
+                # length + masked head/tail so the user can tell at a glance
+                # whether the key was loaded at all, truncated, or mismatched.
+                # The actual key value is NEVER printed in full.
+                if resp.status_code == 401:
+                    masked = f"{self.api_key[:4]}…{self.api_key[-4:]}" if len(self.api_key) >= 12 else "(too short)"
+                    raise NvidiaChatError(
+                        f"401 Unauthorized for {self.model.label}. "
+                        f"Key length={len(self.api_key)}, value={masked} "
+                        f"(env: {self.model.api_key_env}). "
+                        f"Server response: {resp.text[:160]}. "
+                        f"Likely causes: key expired/revoked on build.nvidia.com, "
+                        f"key has invisible whitespace (now auto-stripped on load), "
+                        f"or Colab Secret value differs from the .env value."
+                    )
                 resp.raise_for_status()
                 data = resp.json()
                 return data["choices"][0]["message"]["content"] or ""
