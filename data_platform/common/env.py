@@ -38,7 +38,28 @@ DEFAULT_KEYS: tuple[str, ...] = (
     "TAILSCALE_AUTHKEY",
     "KAGGLE_USERNAME",
     "KAGGLE_KEY",
+    # ── NVIDIA judge API keys ────────────────────────────────────────────
+    # Without these in os.environ the JudgePanel silently constructs every
+    # client as None → all verdicts come back null. The set_env helper now
+    # copies them out of Colab Secrets just like the storage / MLflow keys.
+    "MISTRAL_LARGE_3_675B_API_KEY",
+    "LLAMA_GUARD_4_12B_API_KEY",
+    "NEMETRON_3_CONTENT_SAFETY_API_KEY",
+    # NVIDIA tuning knobs (optional; safe defaults are baked in).
+    "NVIDIA_DEFAULT_RPM",
+    "MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS",
+    # Optional notebook-publish overrides.
+    "NOTEBOOK_NAME",
+    "NOTEBOOK_PATH",
+    # HF push gating.
+    "PUSH_TO_HF",
+    "HF_MODEL_REPO",
+    "HF_REVISION",
 )
+
+_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "NEMETRON_3_CONTENT_SAFETY_API_KEY": ("NEMOTRON_3_CONTENT_SAFETY_API_KEY",),
+}
 
 
 def detect_runtime() -> Runtime:
@@ -79,17 +100,27 @@ def load_env(*env_files: str | Path, override: bool = False) -> None:
 
 
 def _load_from_colab(keys: Iterable[str], override: bool) -> dict[str, str]:
-    """Pull secrets from ``google.colab.userdata`` into ``os.environ``."""
+    """Pull secrets from ``google.colab.userdata`` into ``os.environ``.
+
+    Also accepts spelling aliases via ``_KEY_ALIASES`` — a Colab Secret
+    named with the alias still ends up as the canonical env var. This is
+    a one-line forgiveness for typos like ``NEMETRON`` vs ``NEMOTRON``.
+    """
     from google.colab import userdata  # type: ignore[import-not-found]  # pylint: disable=import-error,no-name-in-module
 
     loaded: dict[str, str] = {}
     for key in keys:
         if not override and os.environ.get(key):
             continue
-        try:
-            value = userdata.get(key)
-        except Exception:
-            continue
+        value = None
+        # Try the canonical name first, then any aliases.
+        for candidate in (key, *_KEY_ALIASES.get(key, ())):
+            try:
+                value = userdata.get(candidate)
+            except Exception:
+                value = None
+            if value is not None:
+                break
         if value is None:
             continue
         os.environ[key] = str(value)
