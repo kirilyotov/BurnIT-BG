@@ -43,6 +43,22 @@ def _try_import_unsloth() -> Any:
         return None
 
 
+def _pick_compute_dtype() -> Any:
+    """Pick bf16 on Ampere+ GPUs, fp16 elsewhere (e.g. Colab T4 = Turing 7.5).
+
+    Mixing dtypes between the base model and the trainer's AMP path triggers
+    ``"_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for
+    'BFloat16'`` — fp16 GradScaler can't unscale bf16 grads. Resolving the
+    dtype once here and threading it through both the Unsloth and transformers
+    paths keeps weights, compute, and AMP aligned.
+    """
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 QUANTIZATIONS = ("4bit", "8bit", "none", "bf16", "fp16")
 
 
@@ -124,6 +140,10 @@ def load_model_unsloth(
     is_4bit = quantization == "4bit"
     is_8bit = quantization == "8bit"
 
+    
+    if dtype is None:
+        dtype = _pick_compute_dtype()
+
     # Gemma 3 nests legacy hyperparameters under ``config.text_config``; unsloth
     # and some transformers paths still read them from the root. Patch once so
     # ``config.max_position_embeddings`` etc. transparently work.
@@ -133,7 +153,8 @@ def load_model_unsloth(
     # Unsloth supports 4bit and full-precision; it does NOT expose 8-bit, so we
     # fall back to plain transformers + bitsandbytes for that case.
     if FastLanguageModel is not None and not is_8bit:
-        log.info("Loading %s via Unsloth (quantization=%s)", model_name, quantization)
+        log.info("Loading %s via Unsloth (quantization=%s, dtype=%s)",
+                 model_name, quantization, dtype)
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=max_seq_length,
@@ -149,20 +170,19 @@ def load_model_unsloth(
         log.warning("Unsloth not installed; falling back to transformers + bitsandbytes.")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    import torch
 
     quant_cfg = None
     if is_4bit:
         quant_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=dtype,
             bnb_4bit_use_double_quant=True,
         )
     elif is_8bit:
         quant_cfg = BitsAndBytesConfig(
             load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.bfloat16,
+            bnb_8bit_compute_dtype=dtype,
         )
     # "none" / "bf16" / "fp16" -> quant_cfg stays None
 
@@ -170,7 +190,7 @@ def load_model_unsloth(
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quant_cfg,
-        torch_dtype=dtype or torch.bfloat16,
+        torch_dtype=dtype,
         device_map="auto",
         token=token,
     )
