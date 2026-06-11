@@ -43,6 +43,23 @@ def _try_import_unsloth() -> Any:
         return None
 
 
+def _has_real_bf16_training() -> bool:
+    """Return True only when bf16 *training* is actually viable.
+
+    ``torch.cuda.is_bf16_supported()`` is unreliable — on recent PyTorch it
+    returns True for Turing T4 (compute 7.5) too, even though SFTConfig will
+    reject ``bf16=True`` with "Your setup doesn't support bf16/gpu. You need
+    Ampere+". The only safe signal is the device's compute capability: bf16
+    training needs Ampere (8.0+) or newer.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 8
+
+
 def _pick_compute_dtype() -> Any:
     """Pick bf16 on Ampere+ GPUs, fp16 elsewhere (e.g. Colab T4 = Turing 7.5).
 
@@ -54,7 +71,7 @@ def _pick_compute_dtype() -> Any:
     """
     import torch
 
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if _has_real_bf16_training():
         return torch.bfloat16
     return torch.float16
 
