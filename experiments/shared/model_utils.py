@@ -39,7 +39,12 @@ def _try_import_unsloth() -> Any:
     try:
         from unsloth import FastLanguageModel
         return FastLanguageModel
-    except ImportError:
+    except ImportError as exc:
+        log.info("Unsloth ImportError (fast path disabled): %s", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        log.warning("Unsloth installed but failed to import (%s): %s",
+                    type(exc).__name__, exc)
         return None
 
 
@@ -217,6 +222,20 @@ def load_model_unsloth(
     return model, tokenizer
 
 
+def _align_trainable_dtype(model: Any, target_dtype: Any) -> None:
+    """Force every trainable parameter onto ``target_dtype`` in-place."""
+    import torch
+    if not isinstance(target_dtype, torch.dtype):
+        return
+    n = 0
+    for p in model.parameters():
+        if p.requires_grad and p.dtype != target_dtype:
+            p.data = p.data.to(target_dtype)
+            n += 1
+    if n:
+        log.info("Aligned %d trainable params to %s", n, target_dtype)
+
+
 def apply_qlora(
     model: Any,
     *,
@@ -227,6 +246,7 @@ def apply_qlora(
     bias: str = "none",
     use_gradient_checkpointing: str | bool = "unsloth",
     random_state: int = 42,
+    dtype: Any = None,
 ) -> Any:
     """Wrap a base model with QLoRA adapters (Unsloth fast path preferred)."""
     target_modules = target_modules or DEFAULT_TARGET_MODULES
@@ -234,7 +254,7 @@ def apply_qlora(
     FastLanguageModel = _try_import_unsloth()
     if FastLanguageModel is not None:
         log.info("Applying QLoRA via Unsloth: r=%d alpha=%d", r, lora_alpha)
-        return FastLanguageModel.get_peft_model(
+        model = FastLanguageModel.get_peft_model(
             model,
             r=r,
             target_modules=target_modules,
@@ -244,6 +264,9 @@ def apply_qlora(
             use_gradient_checkpointing=use_gradient_checkpointing,
             random_state=random_state,
         )
+        target = dtype or _pick_compute_dtype()
+        _align_trainable_dtype(model, target)
+        return model
 
     log.warning("Unsloth not installed; using peft + prepare_model_for_kbit_training.")
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -257,7 +280,10 @@ def apply_qlora(
         bias=bias,
         task_type="CAUSAL_LM",
     )
-    return get_peft_model(model, peft_config)
+    model = get_peft_model(model, peft_config)
+    target = dtype or _pick_compute_dtype()
+    _align_trainable_dtype(model, target)
+    return model
 
 
 def apply_dora(
