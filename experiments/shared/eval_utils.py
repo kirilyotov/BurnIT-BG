@@ -193,6 +193,71 @@ def plot_metric_scorecard(metrics: dict, *, title="scorecard"):
     return fig
 
 
+def per_epoch_metrics_table(history: list[dict]) -> list[dict]:
+    """Aggregate per-epoch training + eval metrics from ``trainer.state.log_history``.
+
+    Returns one row per completed epoch with the columns shown live by TRL's
+    SFTTrainer (epoch / training_loss / validation_loss / entropy /
+    mean_token_accuracy / num_tokens). NaN where missing — older TRL versions
+    don't emit ``eval_entropy`` etc.
+
+    Use ``plot_per_epoch_metrics`` to render as a table figure for MLflow.
+    """
+    eval_rows = [h for h in history if "eval_loss" in h]
+    rows: list[dict] = []
+    for ev in eval_rows:
+        ep = float(ev.get("epoch", 0.0))
+        # Most recent training-loss entry at or before this epoch
+        train_before = [h for h in history
+                        if "loss" in h and "eval_loss" not in h
+                        and float(h.get("epoch", 0.0)) <= ep]
+        train_loss = float(train_before[-1]["loss"]) if train_before else float("nan")
+        rows.append({
+            "epoch": round(ep, 2),
+            "training_loss": round(train_loss, 4),
+            "validation_loss": round(float(ev.get("eval_loss", float("nan"))), 4),
+            "entropy": round(float(ev.get("eval_entropy", float("nan"))), 4),
+            "mean_token_accuracy": round(float(ev.get("eval_mean_token_accuracy",
+                                                       float("nan"))), 4),
+            "num_tokens": int(ev.get("eval_num_tokens", 0)),
+        })
+    return rows
+
+
+def plot_per_epoch_metrics(rows: list[dict], *, title: str = "training metrics"):
+    """Render per-epoch metrics rows as a matplotlib table figure.
+
+    Pair with ``per_epoch_metrics_table`` so the same data appears as both a
+    structured artifact (via ``mlflow.log_table``) and a visual snapshot
+    (via ``tracking.log_plot``).
+    """
+    cols = ["epoch", "training_loss", "validation_loss", "entropy",
+            "mean_token_accuracy", "num_tokens"]
+    if not rows:
+        fig, ax = plt.subplots(figsize=(8, 1.5))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "no eval rows in trainer history",
+                ha="center", va="center")
+        ax.set_title(title)
+        return fig
+    cell_text = [[str(r.get(c, "")) for c in cols] for r in rows]
+    fig, ax = plt.subplots(figsize=(11, max(1.5, 0.55 * len(rows) + 1.3)))
+    ax.axis("off")
+    tbl = ax.table(cellText=cell_text, colLabels=cols,
+                   cellLoc="center", loc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1.1, 1.6)
+    # Style header row
+    for i, _ in enumerate(cols):
+        cell = tbl[(0, i)]
+        cell.set_facecolor("#404040")
+        cell.set_text_props(color="white", weight="bold")
+    ax.set_title(title, fontsize=13, pad=14)
+    fig.tight_layout()
+    return fig
+
+
 def overfit_summary(history) -> dict:
     """Return {'final_train_loss','final_eval_loss','overfit_gap','min_eval_loss','min_eval_step','underfit_warning':bool,'initial_train_loss':float}."""
     tr = [h["loss"] for h in history if "loss" in h and "eval_loss" not in h]

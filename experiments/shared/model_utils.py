@@ -443,25 +443,14 @@ tags:
 - mental-health
 - bulgarian
 - peer-support
+- {method}
 - {experiment}{datasets_block}
 ---
 
 # BurnIT-BG — {experiment}
 
 Модел за **емоционална връстническа подкрепа на български език**, обучен с
-техниката `{experiment}` върху `{base_model}`.
-
-## ⚠️ Отказ от отговорност / Disclaimer
-
-Този модел е **само за изследователски цели**. Той **не е медицински съвет**
-и не заменя професионална психологическа или психиатрична помощ.
-This model is for **research only** and is **not medical advice**.
-
-### При криза се обадете / In a crisis, call:
-
-- **112** (спешни случаи / emergency)
-- **116 111** (Национална телефонна линия за деца — free 24/7)
-- **02 492 02 04** (Български Червен кръст — psychosocial support)
+техниката `{method}` върху `{base_model}` направен с изследователски цели.
 
 ## Употреба / Usage
 
@@ -471,7 +460,7 @@ tok = AutoTokenizer.from_pretrained("{repo_id}")
 model = AutoModelForCausalLM.from_pretrained("{repo_id}")
 ```
 
-Tracked in MLflow as experiment `burnit-bg-experiments` (tag `experiment={experiment}`).
+Tracked in MLflow as experiment `{mlflow_experiment}` (tag `experiment={experiment}`).
 """
 
 
@@ -480,16 +469,38 @@ def default_model_card(
     *,
     base_model: str = DEFAULT_MODEL_NAME,
     repo_id: str = "",
-    license: str = "cc-by-nc-4.0",
-    library_name: str = "peft",
+    license: str = "llama3.2",
+    library_name: str | None = None,
     datasets_id: str = "",
+    method: str | None = None,
+    mlflow_experiment: str = "burnit-bg-experiments",
+    merge_adapters: bool = False,
 ) -> str:
-    """Render a Bulgarian/English model card with the required disclaimer."""
+    """Render a Bulgarian/English model card with the required disclaimer.
+
+    Configurable knobs:
+      ``method``: training technique label (``qlora``, ``dora``, ``galore``,
+        ``lora-bf16``, ...). Defaults to ``experiment`` so old callers keep
+        working. Use it when the experiment name and the method differ
+        (e.g. experiment="baseline-v3" but method="qlora").
+      ``mlflow_experiment``: MLflow experiment name shown in the footer.
+        Defaults to ``burnit-bg-experiments``.
+      ``license``: Now defaults to ``llama3.2`` (Llama Community License)
+        which is what Meta requires for derivatives. Was ``cc-by-nc-4.0``
+        — incompatible with Meta's terms.
+      ``library_name``: When None, picks ``transformers`` for merged models
+        and ``peft`` for adapter-only uploads. Override if you know better.
+    """
     datasets_block = f"\ndatasets:\n- {datasets_id}" if datasets_id else ""
+    if library_name is None:
+        library_name = "transformers" if merge_adapters else "peft"
+    if method is None:
+        method = experiment
     return MODEL_CARD_TEMPLATE.format(
         experiment=experiment, base_model=base_model,
         repo_id=repo_id or "<your-repo>", license=license,
         library_name=library_name, datasets_block=datasets_block,
+        method=method, mlflow_experiment=mlflow_experiment,
     )
 
 
@@ -510,6 +521,10 @@ def push_to_hf(
     merge_adapters: bool = False,
     model_card: str | None = None,
     commit_message: str = "Upload BurnIT-BG model",
+    method: str | None = None,
+    mlflow_experiment: str = "burnit-bg-experiments",
+    base_model: str = DEFAULT_MODEL_NAME,
+    license: str = "llama3.2",
 ) -> str:
     """Save ``model``+``tokenizer`` locally and upload to an HF model repo.
 
@@ -535,7 +550,13 @@ def push_to_hf(
         save_model_local(model, tokenizer, out)
 
     card = model_card or default_model_card(
-        experiment or "experiment", repo_id=repo_id,
+        experiment or "experiment",
+        repo_id=repo_id,
+        method=method,
+        mlflow_experiment=mlflow_experiment,
+        base_model=base_model,
+        license=license,
+        merge_adapters=merge_adapters,
     )
     (out / "README.md").write_text(card, encoding="utf-8")
 
