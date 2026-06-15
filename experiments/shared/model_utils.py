@@ -510,6 +510,70 @@ def default_repo_for(experiment: str, *, user: str = "kiplayo", repo: str = "Bur
     return f"{user}/{repo}", revision
 
 
+def _sanitize_for_git_ref(s: str) -> str:
+    """Lowercase + collapse non-alphanum runs to '-'. Result is a safe git ref.
+
+    Git refs can't contain ``..``, ``//``, ``@{``, control chars, spaces, `~`,
+    `^`, `:`, `?`, `*`, `[`, `\\`. Lowercasing isn't required but matches HF
+    convention (branch names like ``main`` / ``baseline`` / ``dora`` etc.).
+    """
+    out = []
+    for ch in s.lower():
+        if ch.isalnum() or ch in ("-", "."):
+            out.append(ch)
+        else:
+            out.append("-")
+    # Collapse runs of '-' and trim leading/trailing
+    joined = "".join(out)
+    while "--" in joined:
+        joined = joined.replace("--", "-")
+    return joined.strip("-")
+
+
+def hf_branch_name(
+    experiment_type: str,
+    algorithm: str,
+    model_name: str,
+    dataset_name: str = "",
+    *,
+    max_len: int = 100,
+) -> str:
+    """Build a HuggingFace branch / revision name from experiment metadata.
+
+    Convention: ``{experiment_type}-{algorithm}-{model_basename}-{dataset_tag}``
+    e.g. ``finetune-qlora-llama-3.2-1b-instruct-chitanka-bg-mh-counseling-bg``.
+
+    Each segment is sanitised (lowercased, non-alphanum → '-'); the whole
+    name is trimmed to ``max_len`` chars on the right so really-long dataset
+    lists don't overflow git ref limits (HF caps refs at 256 chars but
+    shorter is friendlier in URLs).
+
+    Args:
+      experiment_type: high-level bucket — ``finetune`` | ``pruning`` |
+        ``unlearning`` | ``r-tuning``, etc.
+      algorithm: the technique inside the bucket — ``qlora`` | ``dora`` |
+        ``lora-bf16`` | ``galore`` | ``layer-pruning`` | ``neuron-pruning``,
+        etc.
+      model_name: the base model (e.g. ``meta-llama/Llama-3.2-1B-Instruct``).
+        Only the basename is used; the org prefix is dropped.
+      dataset_name: comma- or +-separated dataset identifiers. Optional —
+        omit for branches that aren't dataset-specific.
+      max_len: hard cap on the output length (default 100 chars).
+    """
+    model_base = model_name.split("/")[-1] if "/" in model_name else model_name
+    parts = [
+        _sanitize_for_git_ref(experiment_type),
+        _sanitize_for_git_ref(algorithm),
+        _sanitize_for_git_ref(model_base),
+    ]
+    if dataset_name:
+        # Multiple datasets typically join with ',' (registry IDs) or '+'
+        dataset_tag = dataset_name.replace(",", "+")
+        parts.append(_sanitize_for_git_ref(dataset_tag))
+    name = "-".join(p for p in parts if p)
+    return name[:max_len].rstrip("-")
+
+
 def push_to_hf(
     model: Any,
     tokenizer: Any,
