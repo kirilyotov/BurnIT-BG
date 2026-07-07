@@ -29,6 +29,16 @@ from .kaggle_dataset import (
     dataset_slug as kaggle_dataset_slug,
     download_repo as kaggle_download_repo,
 )
+from .build_dataset import BuildConfig, build_dataset, maybe_upload, split_by_topic
+from .build_qa_dataset import QABuildConfig, build_qa_dataset
+from .publish_dataset import PublishConfig, publish_dataset, stage_repo
+from .rewrite_instructions import RewriteConfig, rewrite_instructions
+from .rtuning.build_rtuning import BuildRTuningConfig, REFUSAL_TEMPLATES_BG, build_rtuning
+from .rtuning.combine import CombineConfig, combine_datasets
+from .rtuning.download_raw import SOURCE_SPECS, DownloadRawConfig, download_raw
+from .rtuning.publish_dataset import PublishRTuningConfig, publish_rtuning
+from .rtuning.translate import TranslateRTuningConfig, translate_rtuning
+from .rtuning.upload_raw import UploadRawConfig, upload_raw
 from .io_utils import RecordWriter, get_nested, read_records, set_nested
 from .translate import Translator, TranslatorConfig
 
@@ -77,7 +87,7 @@ def _build_storage(
     return StorageBackend(backend=backend, bucket=bucket)
 
 
-# ----- translate ------------------------------------------------------------
+# ###### translate ######
 
 
 def _cmd_translate(args: argparse.Namespace) -> int:
@@ -130,7 +140,7 @@ def _detect_string_keys(record: dict) -> List[str]:
     return [k for k, v in record.items() if isinstance(v, str)]
 
 
-# ----- filter-language ------------------------------------------------------
+# ###### filter-language ######
 
 
 def _cmd_filter_language(args: argparse.Namespace) -> int:
@@ -198,7 +208,7 @@ def _cmd_filter_language(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----- hf-dataset -----------------------------------------------------------
+# ###### hf-dataset ######
 
 
 def _cmd_hf_dataset(args: argparse.Namespace) -> int:
@@ -266,7 +276,7 @@ def _cmd_hf_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----- kaggle-dataset -------------------------------------------------------
+# ###### kaggle-dataset ######
 
 
 def _cmd_kaggle_dataset(args: argparse.Namespace) -> int:
@@ -351,7 +361,281 @@ def _cmd_kaggle_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----- argument parser ------------------------------------------------------
+# ###### from-passages ######
+
+
+def _cmd_from_passages(args: argparse.Namespace) -> int:
+    """Build an Alpaca-style mental-health JSONL from extracted passages."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+
+    cfg = BuildConfig(
+        input_path=Path(args.input),
+        output_path=Path(args.output),
+        seed=args.seed,
+        min_words=args.min_words,
+        max_chars=args.max_chars,
+        drop_dangerous=not args.allow_dangerous,
+        extraction_date=args.date,
+        quality_score=args.quality_score,
+    )
+    total_in, total_out = build_dataset(cfg)
+    print(f"\nbuild-from-passages: read {total_in} passages, wrote {total_out} records "
+          f"-> {cfg.output_path}")
+
+    if not args.skip_minio:
+        try:
+            uri = maybe_upload(cfg.output_path, source=args.source, date=args.date, bucket=args.bucket)
+            if uri:
+                print(f"uploaded -> {uri}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] MinIO upload failed: {exc}", file=sys.stderr)
+    return 0
+
+
+# ###### rewrite-instructions ######
+
+
+def _cmd_rewrite_instructions(args: argparse.Namespace) -> int:
+    """Rewrite each record's instruction with Mistral so it actually fits its passage."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+    cache_path = Path(args.cache) if args.cache else None
+    cfg = RewriteConfig(
+        input_path=Path(args.input),
+        output_path=Path(args.output),
+        model=args.model,
+        concurrency=args.concurrency,
+        batch_size=args.batch_size,
+        max_passage_chars=args.max_passage_chars,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        cache_path=cache_path,
+        extraction_date=args.date,
+    )
+    counts = rewrite_instructions(cfg)
+    print(
+        f"\nrewrite-instructions: read {counts['total_in']}, "
+        f"rewrote {counts['rewritten_live']}, cached {counts['cache_hits']}, "
+        f"fallback (kept original) {counts['fallbacks']} -> {cfg.output_path}"
+    )
+    if not args.skip_minio:
+        try:
+            uri = maybe_upload(cfg.output_path, source=args.source, date=args.date, bucket=args.bucket)
+            if uri:
+                print(f"uploaded -> {uri}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] MinIO upload failed: {exc}", file=sys.stderr)
+    return 0
+
+
+# ###### qa-from-passages ######
+
+
+def _cmd_qa_from_passages(args: argparse.Namespace) -> int:
+    """Generate a real Bulgarian Q->A dataset from passages via an LLM."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+
+    cache_path = Path(args.cache) if args.cache else None
+    cfg = QABuildConfig(
+        input_path=Path(args.input),
+        output_path=Path(args.output),
+        model=args.model,
+        limit=args.limit,
+        min_words=args.min_words,
+        max_passage_chars=args.max_passage_chars,
+        delay=args.delay,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        cache_path=cache_path,
+        quality_score=args.quality_score,
+        extraction_date=args.date,
+    )
+    total_in, total_out = build_qa_dataset(cfg)
+    print(f"\nqa-from-passages: read {total_in} passages, wrote {total_out} Q->A records "
+          f"-> {cfg.output_path}")
+
+    if not args.skip_minio:
+        try:
+            uri = maybe_upload(cfg.output_path, source=args.source, date=args.date, bucket=args.bucket)
+            if uri:
+                print(f"uploaded -> {uri}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] MinIO upload failed: {exc}", file=sys.stderr)
+    return 0
+
+
+# ###### publish-dataset ######
+
+
+def _cmd_publish_dataset(args: argparse.Namespace) -> int:
+    """Stage (and optionally upload) the mental-health dataset to HuggingFace."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+
+    cfg = PublishConfig(
+        repo_id=args.repo,
+        staging_dir=Path(args.staging_dir),
+        style_path=Path(args.style) if args.style else None,
+        qa_path=Path(args.qa) if args.qa else None,
+        splits_dir=Path(args.splits_dir) if args.splits_dir else None,
+        private=args.private,
+        license=args.license,
+    )
+
+    if args.stage_only:
+        staging = stage_repo(cfg)
+        print(f"\nstaged dataset repo at: {staging}")
+        print("(review it, then re-run without --stage-only to upload)")
+        return 0
+
+    uri = publish_dataset(cfg)
+    print(f"\npublished -> {uri}  (private={cfg.private})")
+    return 0
+
+
+# ###### split-by-topic ######
+
+
+def _cmd_split_by_topic(args: argparse.Namespace) -> int:
+    """Split a built Alpaca dataset into per-topic + combined train/eval sets."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    results = split_by_topic(
+        input_path=Path(args.input),
+        out_dir=Path(args.out_dir),
+        eval_ratio=args.eval_ratio,
+        seed=args.seed,
+        min_per_topic=args.min_per_topic,
+        stratify_by=args.stratify_by,
+    )
+
+    print(f"\nsplit-by-topic -> {args.out_dir}")
+    print(f"{'split':<24}{'train':>8}{'eval':>8}")
+    for name in ["all"] + sorted(n for n in results if n != "all"):
+        n_train, n_eval = results[name]
+        print(f"{name:<24}{n_train:>8}{n_eval:>8}")
+    print(f"\n{len(results) - 1} topic splits + 1 combined ('all').")
+    return 0
+
+
+# ###### R-Tuning pipeline ######
+
+
+def _cmd_rtuning_download(args: argparse.Namespace) -> int:
+    """Download a slimmed raw TriviaQA / SQuAD v2 to local jsonl."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+    cfg = DownloadRawConfig(
+        source=args.source,
+        output_dir=Path(args.output_dir),
+        split=args.split,
+        limit=args.limit,
+        revision=args.revision,
+    )
+    out_path = download_raw(cfg)
+    print(f"\nrtuning-download: {args.source} -> {out_path}")
+    return 0
+
+
+def _cmd_rtuning_upload_raw(args: argparse.Namespace) -> int:
+    """Push slimmed raw to MinIO (and optionally HF)."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+    cfg = UploadRawConfig(
+        source=args.source,
+        raw_jsonl=Path(args.input),
+        minio_prefix=args.minio_prefix,
+        hf_repo_id=args.hf_repo,
+        push_minio=not args.skip_minio,
+        push_hf=args.push_hf,
+        private=args.private,
+        minio_bucket=args.bucket,
+    )
+    res = upload_raw(cfg)
+    print(f"\nrtuning-upload-raw: minio={res['minio']}  hf={res['hf']}")
+    return 0
+
+
+def _cmd_rtuning_translate(args: argparse.Namespace) -> int:
+    """BG-translate the question + answer columns of a raw R-Tuning jsonl."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+    cfg = TranslateRTuningConfig(
+        input_jsonl=Path(args.input),
+        output_jsonl=Path(args.output),
+        cache_path=Path(args.cache) if args.cache else None,
+        source_lang=args.source_lang,
+        target_lang=args.target_lang,
+        fields=tuple(f.strip() for f in args.fields.split(",") if f.strip()),
+        concurrency=args.concurrency,
+        chunk_size=args.chunk_size,
+        delay=args.delay,
+        flush_every=args.flush_every,
+        limit=args.limit,
+        backend=args.backend,
+        backend_url=args.backend_url,
+    )
+    counts = translate_rtuning(cfg)
+    print(f"\nrtuning-translate: input={counts['total_in']} translated={counts['translated']} "
+          f"resumed_from={counts.get('resumed_from', 0)} "
+          f"cache={counts.get('cache_size', 0)} -> {cfg.output_jsonl}")
+    return 0
+
+
+def _cmd_rtuning_build(args: argparse.Namespace) -> int:
+    """Turn translated rows into Alpaca-style R-Tuning records."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+    cfg = BuildRTuningConfig(
+        input_jsonl=Path(args.input),
+        output_jsonl=Path(args.output),
+        refusal_templates=REFUSAL_TEMPLATES_BG,
+        rotate=args.rotate,
+        seed=args.seed,
+    )
+    counts = build_rtuning(cfg)
+    print(f"\nrtuning-build: total={counts['total_in']} written={counts['written']} "
+          f"skipped={counts['skipped_no_question']} -> {cfg.output_jsonl}")
+    return 0
+
+
+def _cmd_rtuning_combine(args: argparse.Namespace) -> int:
+    """Concatenate + shuffle multiple R-Tuning jsonls into one combined file."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    cfg = CombineConfig(
+        inputs=[Path(p) for p in args.inputs],
+        output_jsonl=Path(args.output),
+        shuffle=not args.no_shuffle,
+        seed=args.seed,
+    )
+    res = combine_datasets(cfg)
+    print(f"\nrtuning-combine: total={res['total']}  per_source={res['per_source']} "
+          f"-> {cfg.output_jsonl}")
+    return 0
+
+
+def _cmd_rtuning_publish(args: argparse.Namespace) -> int:
+    """Push a curated R-Tuning jsonl to MinIO (and optionally HF) with a data card."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _load_env()
+    cfg = PublishRTuningConfig(
+        dataset_jsonl=Path(args.input),
+        minio_prefix=args.minio_prefix,
+        hf_repo_id=args.hf_repo,
+        sources=[s.strip() for s in args.sources.split(",") if s.strip()],
+        push_minio=not args.skip_minio,
+        push_hf=args.push_hf,
+        private=args.private,
+        minio_bucket=args.bucket,
+    )
+    res = publish_rtuning(cfg)
+    print(f"\nrtuning-publish: minio={res['minio']}  hf={res['hf']}")
+    return 0
+
+
+# ###### argument parser ######
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -513,6 +797,244 @@ def build_parser() -> argparse.ArgumentParser:
     pk.add_argument("--skip-minio", action="store_true")
     pk.add_argument("--skip-hf", action="store_true")
 
+    pfp = sub.add_parser(
+        "from-passages",
+        help="Build a Bulgarian Alpaca dataset from extracted Chitanka passages.",
+    )
+    pfp.add_argument("--input", required=True,
+                     help="Path to passages JSONL produced by data_scraping extract-passages.")
+    pfp.add_argument("--output", required=True,
+                     help="Where to write the Alpaca JSONL.")
+    pfp.add_argument("--source", default="chitanka",
+                     help="Source label baked into each record's metadata + MinIO path.")
+    pfp.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
+                     help="Date segment used in the MinIO destination key.")
+    pfp.add_argument("--seed", type=int, default=42,
+                     help="Random seed for the instruction-template sampler.")
+    pfp.add_argument("--min-words", type=int, default=12,
+                     help="Drop records whose output has fewer than N whitespace tokens. "
+                          "Book passages are short, so the default is 12 (was 30, which "
+                          "dropped a large share of otherwise-valid passages).")
+    pfp.add_argument("--max-chars", type=int, default=1500,
+                     help="Trim outputs longer than this many characters.")
+    pfp.add_argument("--quality-score", type=float, default=0.80,
+                     help="Default quality_score baked into every record (0..1).")
+    pfp.add_argument("--allow-dangerous", action="store_true",
+                     help="Disable the dangerous-phrase filter (NOT recommended).")
+    pfp.add_argument("--bucket", default=None,
+                     help="MinIO bucket override (defaults to env MINIO_BUCKET).")
+    pfp.add_argument("--skip-minio", action="store_true",
+                     help="Don't upload the built JSONL to MinIO; write only locally.")
+
+    pri = sub.add_parser(
+        "rewrite-instructions",
+        help="Rewrite each record's instruction with Mistral so it actually matches its passage.",
+    )
+    pri.add_argument("--input", required=True,
+                     help="Path to the existing Alpaca dataset JSONL (output of from-passages).")
+    pri.add_argument("--output", required=True,
+                     help="Where to write the rewritten JSONL (e.g. .../dataset_ai_improved.jsonl).")
+    pri.add_argument("--model", default="mistral-large-3",
+                     help="NVIDIA model handle (default: mistral-large-3).")
+    pri.add_argument("--concurrency", type=int, default=8,
+                     help="Number of parallel Mistral calls per batch (default: 8).")
+    pri.add_argument("--batch-size", type=int, default=50,
+                     help="Records per concurrent batch (default: 50).")
+    pri.add_argument("--max-passage-chars", type=int, default=1000,
+                     help="Trim each passage to this many chars before sending.")
+    pri.add_argument("--temperature", type=float, default=0.3,
+                     help="Sampling temperature for question generation.")
+    pri.add_argument("--max-tokens", type=int, default=200,
+                     help="Max tokens per generated question.")
+    pri.add_argument("--cache", default=str(DEFAULT_TMP / "rewrite_cache.json"),
+                     help="JSON cache keyed by passage_id so re-runs resume.")
+    pri.add_argument("--source", default="chitanka",
+                     help="Source label for the MinIO destination key.")
+    pri.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
+                     help="Date segment used in the MinIO destination key.")
+    pri.add_argument("--bucket", default=None,
+                     help="MinIO bucket override (defaults to env MINIO_BUCKET).")
+    pri.add_argument("--skip-minio", action="store_true",
+                     help="Don't upload the output to MinIO; write only locally.")
+
+    pqa = sub.add_parser(
+        "qa-from-passages",
+        help="Generate a real Bulgarian question->answer dataset from passages via an LLM.",
+    )
+    pqa.add_argument("--input", required=True,
+                     help="Path to passages JSONL produced by data_scraping extract-passages.")
+    pqa.add_argument("--output", required=True,
+                     help="Where to write the generated Q->A Alpaca JSONL.")
+    pqa.add_argument("--model", default="mistral-large-3",
+                     help="NVIDIA model handle to generate with (default: mistral-large-3).")
+    pqa.add_argument("--limit", type=int, default=None,
+                     help="Only process the first N passages (use a small value to test cost first).")
+    pqa.add_argument("--min-words", type=int, default=12,
+                     help="Drop generated answers shorter than N words.")
+    pqa.add_argument("--max-passage-chars", type=int, default=1200,
+                     help="Trim each source passage to this many characters before sending.")
+    pqa.add_argument("--delay", type=float, default=0.0,
+                     help="Sleep seconds between API calls (rate limiting).")
+    pqa.add_argument("--temperature", type=float, default=0.6,
+                     help="Sampling temperature for generation (default: 0.6).")
+    pqa.add_argument("--max-tokens", type=int, default=1024,
+                     help="Max tokens per generated Q->A pair.")
+    pqa.add_argument("--cache", default=str(DEFAULT_TMP / "qa_cache.json"),
+                     help="JSON cache keyed by passage_id so re-runs skip generated passages.")
+    pqa.add_argument("--quality-score", type=float, default=0.85,
+                     help="Default quality_score baked into every record (0..1).")
+    pqa.add_argument("--source", default="chitanka",
+                     help="Source label for the MinIO destination path.")
+    pqa.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
+                     help="Date segment used in the MinIO destination key.")
+    pqa.add_argument("--bucket", default=None,
+                     help="MinIO bucket override (defaults to env MINIO_BUCKET).")
+    pqa.add_argument("--skip-minio", action="store_true",
+                     help="Don't upload the built JSONL to MinIO; write only locally.")
+
+    ppub = sub.add_parser(
+        "publish-dataset",
+        help="Stage + upload the mental-health dataset(s) to a HuggingFace dataset repo.",
+    )
+    ppub.add_argument("--repo", required=True,
+                      help="HuggingFace dataset repo id (e.g. username/burnit-bg-mental-health).")
+    ppub.add_argument("--style", default=None,
+                      help="Path to the style dataset JSONL (from `from-passages`). "
+                           "NOTE: contains verbatim book excerpts — mind copyright.")
+    ppub.add_argument("--qa", default=None,
+                      help="Path to the synthetic Q->A dataset JSONL (from `qa-from-passages`).")
+    ppub.add_argument("--splits-dir", default=None,
+                      help="Path to the topic-splits directory (from `split-by-topic`).")
+    ppub.add_argument("--staging-dir", default=str(DEFAULT_TMP / "hf_dataset_staging"),
+                      help="Local directory to assemble the repo in before upload.")
+    ppub.add_argument("--license", default="cc-by-nc-4.0",
+                      help="License string for the data card (default: cc-by-nc-4.0).")
+    ppub.add_argument("--private", action="store_true",
+                      help="Create the repo as private (default: public).")
+    ppub.add_argument("--stage-only", action="store_true",
+                      help="Assemble the repo locally but do NOT upload (review first).")
+
+    pst = sub.add_parser(
+        "split-by-topic",
+        help="Split a built Alpaca dataset into per-topic + combined train/eval sets.",
+    )
+    pst.add_argument("--input", required=True,
+                     help="Path to a built Alpaca dataset JSONL (from `from-passages`).")
+    pst.add_argument("--out-dir", required=True,
+                     help="Directory to write all/ and by-topic/{topic}/ splits into.")
+    pst.add_argument("--eval-ratio", type=float, default=0.1,
+                     help="Fraction of each split held out for eval (default: 0.1).")
+    pst.add_argument("--seed", type=int, default=42,
+                     help="Shuffle/split seed (default: 42).")
+    pst.add_argument("--min-per-topic", type=int, default=10,
+                     help="Topics with fewer records are folded into a _misc bucket.")
+    pst.add_argument("--stratify-by", default="category",
+                     help="Record field to stratify each split by (default: category).")
+
+    # ── R-Tuning subcommands ────────────────────────────────────────────────
+    SOURCE_CHOICES = sorted(SOURCE_SPECS.keys())
+
+    prtd = sub.add_parser(
+        "rtuning-download",
+        help="Download a slimmed raw R-Tuning source (TriviaQA / SQuAD v2).",
+    )
+    prtd.add_argument("--source", required=True, choices=SOURCE_CHOICES,
+                      help="Upstream dataset to fetch.")
+    prtd.add_argument("--output-dir", required=True,
+                      help="Local directory to write the raw jsonl into.")
+    prtd.add_argument("--split", default="train", help="Upstream split (default: train).")
+    prtd.add_argument("--limit", type=int, default=None,
+                      help="Only fetch the first N rows (smoke-test mode).")
+    prtd.add_argument("--revision", default=None, help="Pin a specific HF dataset revision.")
+
+    prtu = sub.add_parser(
+        "rtuning-upload-raw",
+        help="Push slimmed raw R-Tuning jsonl to MinIO (and optionally HF Hub).",
+    )
+    prtu.add_argument("--source", required=True, choices=SOURCE_CHOICES)
+    prtu.add_argument("--input", required=True, help="Raw jsonl produced by rtuning-download.")
+    prtu.add_argument("--minio-prefix", required=True,
+                      help="Destination prefix in the MinIO bucket "
+                           "(e.g. datasets/rtuning/triviaqa/2026-06-02/raw).")
+    prtu.add_argument("--hf-repo", default=None,
+                      help="HF dataset repo id (e.g. kiplayo/rtuning-triviaqa-raw).")
+    prtu.add_argument("--push-hf", action="store_true",
+                      help="Actually push to HF (default: stage to MinIO only).")
+    prtu.add_argument("--private", action="store_true", help="Create the HF repo as private.")
+    prtu.add_argument("--bucket", default=None, help="MinIO bucket override.")
+    prtu.add_argument("--skip-minio", action="store_true", help="Don't upload to MinIO.")
+
+    prtt = sub.add_parser(
+        "rtuning-translate",
+        help="BG-translate the question + answer columns of a raw R-Tuning jsonl.",
+    )
+    prtt.add_argument("--input", required=True)
+    prtt.add_argument("--output", required=True)
+    prtt.add_argument("--cache",
+                      default=str(DEFAULT_TMP / "rtuning" / "translate_cache.json"))
+    prtt.add_argument("--source-lang", default="en")
+    prtt.add_argument("--target-lang", default="bg")
+    prtt.add_argument("--fields", default="question,answer",
+                      help="Comma-separated columns to translate (default: question,answer).")
+    prtt.add_argument("--backend", choices=["google", "libretranslate"], default="google",
+                      help="Translation backend (default: google). Use libretranslate "
+                           "for self-hosted unlimited throughput.")
+    prtt.add_argument("--backend-url", default=None,
+                      help="URL for the chosen backend (libretranslate only). "
+                           "Defaults to $LIBRETRANSLATE_URL or http://localhost:5000.")
+    prtt.add_argument("--concurrency", type=int, default=8,
+                      help="Number of parallel translator threads (default: 8 for google, "
+                           "raise to 32-64 for libretranslate).")
+    prtt.add_argument("--chunk-size", type=int, default=500,
+                      help="Records buffered per chunk (default: 500). Lower = "
+                           "more frequent flushes / less memory; higher = less overhead.")
+    prtt.add_argument("--delay", type=float, default=0.0,
+                      help="Sleep seconds between API calls.")
+    prtt.add_argument("--flush-every", type=int, default=100,
+                      help="Flush output every N records.")
+    prtt.add_argument("--limit", type=int, default=None,
+                      help="Only process the first N rows (smoke-test mode).")
+
+    prtb = sub.add_parser(
+        "rtuning-build",
+        help="Assemble translated rows into Alpaca-style R-Tuning records.",
+    )
+    prtb.add_argument("--input", required=True, help="Translated jsonl from rtuning-translate.")
+    prtb.add_argument("--output", required=True)
+    prtb.add_argument("--rotate", choices=["round-robin", "random"], default="round-robin",
+                      help="How to rotate among the 3 BG refusal templates.")
+    prtb.add_argument("--seed", type=int, default=42)
+
+    prtc = sub.add_parser(
+        "rtuning-combine",
+        help="Concatenate + shuffle several R-Tuning jsonls into one combined file.",
+    )
+    prtc.add_argument("--inputs", nargs="+", required=True,
+                      help="Per-source curated jsonls (e.g. triviaqa-bg.jsonl squadv2-bg.jsonl).")
+    prtc.add_argument("--output", required=True)
+    prtc.add_argument("--no-shuffle", action="store_true",
+                      help="Concatenate in input order without shuffling.")
+    prtc.add_argument("--seed", type=int, default=42)
+
+    prtp = sub.add_parser(
+        "rtuning-publish",
+        help="Stage a curated R-Tuning jsonl + data card and push to MinIO + HF.",
+    )
+    prtp.add_argument("--input", required=True, help="Curated jsonl to publish.")
+    prtp.add_argument("--minio-prefix", required=True,
+                      help="Destination prefix in MinIO "
+                           "(e.g. datasets/rtuning/combined/2026-06-02/bg).")
+    prtp.add_argument("--hf-repo", default=None,
+                      help="HF dataset repo id (e.g. kiplayo/burnit-bg-rtuning-combined-bg).")
+    prtp.add_argument("--sources", default="",
+                      help="Comma-separated source tags for the data card "
+                           "(e.g. 'triviaqa,squadv2').")
+    prtp.add_argument("--push-hf", action="store_true",
+                      help="Actually push to HF (default: stage to MinIO only).")
+    prtp.add_argument("--private", action="store_true")
+    prtp.add_argument("--bucket", default=None, help="MinIO bucket override.")
+    prtp.add_argument("--skip-minio", action="store_true", help="Don't upload to MinIO.")
+
     return parser
 
 
@@ -527,6 +1049,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_hf_dataset(args)
     if args.command == "kaggle-dataset":
         return _cmd_kaggle_dataset(args)
+    if args.command == "from-passages":
+        return _cmd_from_passages(args)
+    if args.command == "qa-from-passages":
+        return _cmd_qa_from_passages(args)
+    if args.command == "rewrite-instructions":
+        return _cmd_rewrite_instructions(args)
+    if args.command == "split-by-topic":
+        return _cmd_split_by_topic(args)
+    if args.command == "publish-dataset":
+        return _cmd_publish_dataset(args)
+    if args.command == "rtuning-download":
+        return _cmd_rtuning_download(args)
+    if args.command == "rtuning-upload-raw":
+        return _cmd_rtuning_upload_raw(args)
+    if args.command == "rtuning-translate":
+        return _cmd_rtuning_translate(args)
+    if args.command == "rtuning-build":
+        return _cmd_rtuning_build(args)
+    if args.command == "rtuning-combine":
+        return _cmd_rtuning_combine(args)
+    if args.command == "rtuning-publish":
+        return _cmd_rtuning_publish(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 
